@@ -1,0 +1,14 @@
+_target_: aim.pytorch_lightning.AimLogger
+# Single source of truth for the aim repo (root dir; aim appends .aim).
+# _setup_aim_server reads this, then rewrites it (and aim_run.repo) to the
+# resolved aim:// server URL — do NOT set repo under aim_run blocks.
+repo: "."
+experiment: ${hydra:job.name}
+run_name: ${random_name:}
+run_hash: null
+# Cut rank-0 RocksDB write pressure on the NFS .aim store, whose compaction threads
+# soft-locked and stalled rank 0 into a 600s NCCL timeout (see
+# docs/nccl_timeout_diagnosis.md). Disable system monitoring; keep terminal capture.
+system_tracking_interval: null   # stop periodic CPU/GPU/mem stat writes (was every 10s)
+log_system_params: false         # skip the one-time packages/env/git snapshot
+capture_terminal_logs: true      # keep terminal logs (flushed ~1s on a background thread)

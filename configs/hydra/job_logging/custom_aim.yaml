@@ -1,0 +1,17 @@
+defaults:
+  - custom
+  - _self_
+
+handlers:
+  aim_file:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: verbose
+    filename: ${hydra.runtime.output_dir}/aim.log
+
+loggers:
+  aim:
+    level: DEBUG
+    handlers:
+      - aim_file
+    propagate: False

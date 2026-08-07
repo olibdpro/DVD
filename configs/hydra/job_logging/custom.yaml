@@ -1,0 +1,22 @@
+version: 1
+formatters:
+  simple:
+    format: ' *** %(levelname)s - %(message)s'
+  verbose:
+    format: '[%(asctime)s][%(name)s] - %(levelname)s - %(message)s'
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: WARNING
+    formatter: simple
+    stream: ext://sys.stdout
+  file:
+    class: logging.FileHandler
+    level: DEBUG
+    formatter: verbose
+    filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+root:
+  level: DEBUG
+  handlers:
+    - file
+    - console

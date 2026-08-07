@@ -21,6 +21,12 @@ tabulate==0.9.0
 peft==0.18.1
 matplotlib==3.10.8
 h5py==3.16.0
+# data/ + utils/ (old depth loaders): EXR reads, resize/normalize helpers
+OpenEXR==3.4.8
+imath==0.0.2
+openexr_numpy==0.0.8
+opencv-python==5.0.0.93
+scipy==1.15.3
 deepspeed==0.18.0
 spaces==0.47.0
 gradio==5.49.0

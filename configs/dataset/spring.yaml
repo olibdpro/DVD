@@ -1,0 +1,8 @@
+_target_: data.stereo_dataset.StereoDataset
+root_dir: /jobs/ADGRE/eguo/TEST/Stereo/Datasets/Spring/spring/train/
+left_pattern: "**/frame_left/*.png"
+shot_pattern: "([0-9]*)/frame_left/*"
+frame_pattern: "_([0-9]*).png"
+occlusion_format_str: "/jobs/ADGRE/elwa/OUT/Stereo/Spring/unimatch_disparity_occlusion/train/{file_name}"
+splat_format_str: "/jobs/ADGRE/elwa/OUT/Stereo/Spring/unimatch_splat/train/{file_name}"
+disp_format_str: "/jobs/ADGRE/elwa/OUT/Stereo/Spring/unimatch_disparity/train/{file_name}"
