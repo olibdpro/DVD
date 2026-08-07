@@ -247,7 +247,11 @@ def load_model(ckpt_dir, yaml_args):
         args=yaml_args,
     )
 
-    ckpt_path = os.path.join(ckpt_dir, "model.safetensors")
+    # Accept the .safetensors itself (e.g. ckpt/dvd_1.1.safetensors) or a dir holding
+    # model.safetensors, so v1.0/v1.1 can sit side by side without renaming.
+    ckpt_path = ckpt_dir if os.path.isfile(ckpt_dir) else os.path.join(ckpt_dir, "model.safetensors")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path} (--ckpt {ckpt_dir})")
     state_dict = load_file(ckpt_path, device="cpu")
     dit_state_dict = {k.replace("pipe.dit.", ""): v for k,
                       v in state_dict.items() if "pipe.dit." in k}
