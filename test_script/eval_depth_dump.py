@@ -20,7 +20,8 @@ Each clip is predicted at four input sizes -- the training size (--height/--widt
 width 512, width 1024, and the source's own size. A source already at one of them
 is not resized: that pass is shared by both bins.
 
-Output: <outputs_path>/{train,512,1024,original}/<clip name>/frame_0000.png ...
+Output: <outputs_path>/{train,512,1024,original}/{depth,rgb}/<clip name>/frame_0000.png ...
+The rgb folder holds the exact (resized) frames that were fed to the model.
 """
 
 import argparse
@@ -152,6 +153,15 @@ def save_grayscale(depth, out_dir):
         Image.fromarray(u8, mode="L").save(out_dir / f"frame_{i:04d}.png")
 
 
+def save_rgb(rgb_in, out_dir):
+    """rgb_in (1, T, C, H, W) in [0, 1] -> the PNGs the model actually saw."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = rgb_in[0].permute(0, 2, 3, 1).cpu().numpy()
+    for i, frame in enumerate(frames):
+        u8 = (frame * 255).clip(0, 255).astype(np.uint8)
+        Image.fromarray(u8, mode="RGB").save(out_dir / f"frame_{i:04d}.png")
+
+
 def parse_args():
     p = argparse.ArgumentParser("Dump grayscale depth PNGs")
     p.add_argument("--ckpt", type=str, required=True)
@@ -213,9 +223,10 @@ def main():
                 depth = generate_depth_sliced(
                     model, rgb_in, args.window_size, args.overlap)[0]
             for b in bins:
-                save_grayscale(depth, out_root / b / name)
+                save_grayscale(depth, out_root / b / "depth" / name)
+                save_rgb(rgb_in, out_root / b / "rgb" / name)
             print(f"Wrote {depth.shape[0]} frames to "
-                  + ", ".join(str(out_root / b / name) for b in bins))
+                  + ", ".join(str(out_root / b / "{depth,rgb}" / name) for b in bins))
 
 
 if __name__ == "__main__":
