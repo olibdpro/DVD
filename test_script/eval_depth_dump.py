@@ -16,11 +16,11 @@ python test_script/eval_depth_dump.py --ckpt ckpt --dataset demo/robot_navi.mp4 
 
 --data_root falls back to root_dir in configs/dataset/<name>.yaml when omitted.
 
-Each clip is predicted at four input sizes -- the training size (--height/--width),
-width 512, width 1024, and the source's own size. A source already at one of them
-is not resized: that pass is shared by both bins.
+Each clip is predicted at five input sizes -- the training size (--height/--width),
+width 512, width 1024, width 3840 (4K, upscale-only) and the source's own size. A
+source already at one of them is not resized: that pass is shared by both bins.
 
-Output: <outputs_path>/{train,512,1024,original}/{depth,rgb}/<clip name>/frame_0000.png ...
+Output: <outputs_path>/{train,512,1024,4k,original}/{depth,rgb}/<clip name>/frame_0000.png ...
 The rgb folder holds the exact (resized) frames that were fed to the model.
 """
 
@@ -44,6 +44,8 @@ from test_single_video import (generate_depth_sliced, get_window_index,
                                resize_for_training_scale)
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
+
+UHD_WIDTH = 3840  # the "4k" bin; 16-aligned already, DCI 4096 would be too
 
 # name -> (module, class). Root kwarg differs per family, see build_dataset.
 DATASETS = {
@@ -122,12 +124,16 @@ def iter_clips(args):
 
 
 def size_variants(rgb, args):
-    """Bin name -> input tensor, at the four sizes we predict depth for.
+    """Resulting size -> (resize target, bin names), for the five sizes we predict at.
 
     Keyed by resulting pixel size, so a source already at one of them (or two
     targets landing on the same size) runs a single inference pass shared by
     every bin. 512/1024 are widths with the aspect ratio kept, matching the old
     288x512 / 576x1024 training configs.
+
+    The size is probed on a 1-frame slice and only the target is returned, so
+    main() resizes one clip at a time -- a 300-frame 4K variant is 30 GB.
+    4K is probed last: if it OOMs, the cheaper bins are already on disk.
     """
     H, W = rgb.shape[-2:]
     targets = {
@@ -135,11 +141,16 @@ def size_variants(rgb, args):
         "512": (round(H * 512 / W), 512),
         "1024": (round(H * 1024 / W), 1024),
         "original": (H, W),                        # /16 alignment only, no scaling
+        # 4K upscales a smaller source but never shrinks one that is already >= 4K
+        # wide -- such a source falls through to "original" and shares that pass.
+        "4k": (round(H * max(1.0, UHD_WIDTH / W)), max(W, UHD_WIDTH)),
     }
     variants = {}
-    for name, (th, tw) in targets.items():
-        resized, _ = resize_for_training_scale(rgb, th, tw)
-        variants.setdefault(tuple(resized.shape[-2:]), (resized, []))[1].append(name)
+    for name, target in targets.items():
+        # The target itself is carried, not the probed size: resize_for_training_scale
+        # is not idempotent (1080p -> 1088x1920 -> 1088x1936).
+        probe, _ = resize_for_training_scale(rgb[:, :1], *target)
+        variants.setdefault(tuple(probe.shape[-2:]), (target, []))[1].append(name)
     return variants
 
 
@@ -203,12 +214,26 @@ def check_windows():
 def check_size_variants():
     """A source already at a target size must reuse that pass, not re-run it."""
     a = argparse.Namespace(height=480, width=640)
+
     v = size_variants(torch.zeros(1, 2, 3, 576, 1024), a)   # already the 1024 bin
     at = {b: s for s, (_, bins) in v.items() for b in bins}
-    assert at == {"train": (480, 864), "512": (288, 512),
-                  "1024": (576, 1024), "original": (576, 1024)}, at
-    assert len(v) == 3, v.keys()          # 1024 + original share one inference
+    assert at == {"train": (480, 864), "512": (288, 512), "1024": (576, 1024),
+                  "4k": (2160, 3840), "original": (576, 1024)}, at
+    assert len(v) == 4, v.keys()          # 1024 + original share one inference
     assert all(h % 16 == 0 and w % 16 == 0 for h, w in v), v.keys()
+
+    # A source past 4K is never shrunk to it: "4k" rides along with "original".
+    v = size_variants(torch.zeros(1, 2, 3, 2160, 4096), a)
+    at = {b: s for s, (_, bins) in v.items() for b in bins}
+    assert at["4k"] == at["original"] == (2160, 4096), at
+    assert all(h % 16 == 0 and w % 16 == 0 for h, w in v), v.keys()
+
+    # main() applies the target to the full clip, so it must land on the key
+    # size the 1-frame probe reported -- 1080p is where a non-idempotent
+    # re-resize would drift (1088x1920 -> 1088x1936).
+    clip = torch.zeros(1, 2, 3, 1080, 1920)
+    for size, (target, _) in size_variants(clip, a).items():
+        assert resize_for_training_scale(clip, *target)[0].shape[-2:] == size, target
 
 
 def main():
@@ -217,8 +242,9 @@ def main():
     out_root = Path(args.outputs_path)
 
     for name, rgb in iter_clips(args):
-        for (h, w), (rgb_in, bins) in size_variants(rgb, args).items():
+        for (h, w), (target, bins) in size_variants(rgb, args).items():
             print(f"\n=== {name} @ {h}x{w} -> {bins}")
+            rgb_in, _ = resize_for_training_scale(rgb, *target)
             with torch.no_grad():
                 depth = generate_depth_sliced(
                     model, rgb_in, args.window_size, args.overlap)[0]
