@@ -14,7 +14,13 @@ python test_script/eval_depth_dump.py --ckpt ckpt --dataset DepthCollapse \
 python test_script/eval_depth_dump.py --ckpt ckpt --dataset /path/to/frames -o ./depth_dump
 python test_script/eval_depth_dump.py --ckpt ckpt --dataset demo/robot_navi.mp4 -o ./depth_dump
 
+python test_script/eval_depth_dump.py --ckpt ckpt --dataset demo/robot_navi.mp4 \
+    --find_max_size --window_size 81
+
 --data_root falls back to root_dir in configs/dataset/<name>.yaml when omitted.
+
+--find_max_size skips the dump: it binary-searches the widest input one window
+survives on this GPU at the configured --window_size, prints it, and exits.
 
 Each clip is predicted at five input sizes -- the training size (--height/--width),
 width 512, width 1024, width 3840 (4K, upscale-only) and the source's own size. A
@@ -25,6 +31,7 @@ The rgb folder holds the exact (resized) frames that were fed to the model.
 """
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
@@ -46,6 +53,11 @@ from test_single_video import (generate_depth_sliced, get_window_index,
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
 UHD_WIDTH = 3840  # the "4k" bin; 16-aligned already, DCI 4096 would be too
+
+# --find_max_size reads these as "too big". The CUDA and host allocators word it
+# differently ("CUDA out of memory" vs "DefaultCPUAllocator: can't allocate memory").
+OOM_MARKERS = ("out of memory", "can't allocate memory",
+               "cannot allocate memory", "not enough memory")
 
 # name -> (module, class). Root kwarg differs per family, see build_dataset.
 DATASETS = {
@@ -164,6 +176,76 @@ def save_grayscale(depth, out_dir):
         Image.fromarray(u8, mode="L").save(out_dir / f"frame_{i:04d}.png")
 
 
+def largest_ok(fits, hi):
+    """Largest n in [0, hi] with fits(n) true. Assumes fits is monotone."""
+    lo = 0
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def find_max_size(model, rgb, args):
+    """Binary-search the widest 16-aligned input one window survives on this GPU.
+
+    Returns ((h, w), peak GiB) or (None, None) if even 16px OOMs.
+
+    GPU peak is a single window's inference, so a probe of exactly window_size
+    frames is the worst case -- overlap changes how many windows run, not how
+    big any one of them is. The clip is padded up to window_size so the answer
+    holds for the configured window even when the probe clip is shorter.
+    """
+    H, W = rgb.shape[-2:]
+    probe = rgb[:, :args.window_size]
+    if probe.shape[1] < args.window_size:
+        pad = probe[:, -1:].repeat(1, args.window_size - probe.shape[1], 1, 1, 1)
+        probe = torch.cat([probe, pad], dim=1)
+
+    seen = {}
+
+    def fits(units):
+        tw = units * 16
+        label = f"~{round(H * tw / W)}x{tw}"   # exact size is known after the resize
+        rgb_in = None
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            # The resize is inside the try on purpose: it allocates window_size
+            # frames at the candidate size on the *host*, and climbing past 4K
+            # exhausts host RAM before the GPU is ever asked.
+            rgb_in, _ = resize_for_training_scale(probe, round(H * tw / W), tw)
+            h, w = rgb_in.shape[-2:]
+            label = f"{h}x{w}"
+            with torch.no_grad():
+                generate_depth_sliced(model, rgb_in, args.window_size, args.overlap)
+        except RuntimeError as err:
+            # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
+            # allocator reports exhaustion as a plain one with its own wording.
+            # Anything else is a real bug and must not read as "too big".
+            if not any(m in str(err).lower() for m in OOM_MARKERS):
+                raise
+            print(f"  {label}: OOM")
+            return False
+        else:
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            print(f"  {label}: OK, peak {peak:.2f} GiB")
+            seen[units] = ((h, w), peak)
+            return True
+        finally:
+            del rgb_in
+            # A caught OOM keeps frame locals alive through reference cycles, so
+            # without the collect the next probe OOMs spuriously and the oracle
+            # stops being monotone.
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    best = largest_ok(fits, args.max_search_width // 16)
+    return seen.get(best, (None, None))
+
+
 def save_rgb(rgb_in, out_dir):
     """rgb_in (1, T, C, H, W) in [0, 1] -> the PNGs the model actually saw."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +276,12 @@ def parse_args():
                    help="truncate a folder/video to this many frames")
     p.add_argument("--window_size", type=int, default=81)
     p.add_argument("--overlap", type=int, default=21)
+    p.add_argument("--find_max_size", action="store_true",
+                   help="probe the largest input that fits this GPU at --window_size, "
+                        "then exit without dumping anything")
+    p.add_argument("--max_search_width", type=int, default=UHD_WIDTH,
+                   help="upper bound for --find_max_size; 4K is the largest bin "
+                        "this script dumps, and each probe above it costs host RAM")
     # The "train" bin only; the other three sizes are 512, 1024 and the source's own.
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--width", type=int, default=640)
@@ -209,6 +297,19 @@ def check_windows():
         assert all(w[i + 1][0] <= w[i][1] for i in range(len(w) - 1)), w
         if T > 81:
             assert all(b - a == 81 for a, b in w), w
+
+
+def check_largest_ok():
+    """Must find the threshold exactly, and probe each candidate at most once."""
+    for hi in (0, 1, 7, 64):
+        for t in range(-1, hi + 2):
+            calls = []
+            got = largest_ok(lambda n: calls.append(n) or n <= t, hi)
+            assert got == min(max(t, 0), hi), (hi, t, got)
+            assert len(calls) == len(set(calls)), calls
+            assert len(calls) <= hi.bit_length() + 1, (hi, calls)
+    # A threshold of 0 means everything OOMed: find_max_size reports "nothing fits".
+    assert largest_ok(lambda n: False, 480) == 0
 
 
 def check_size_variants():
@@ -241,6 +342,25 @@ def main():
     model = load_model(args.ckpt, OmegaConf.load(args.model_config))
     out_root = Path(args.outputs_path)
 
+    if args.find_max_size:
+        name, rgb = next(iter_clips(args))
+        total = torch.cuda.get_device_properties(0).total_memory / 2**30
+        print(f"Probing {name} ({rgb.shape[-2]}x{rgb.shape[-1]}, aspect kept) at "
+              f"window_size={args.window_size} overlap={args.overlap} on "
+              f"{torch.cuda.get_device_name(0)} ({total:.1f} GiB)")
+        size, peak = find_max_size(model, rgb, args)
+        if size is None:
+            print("\nNothing fits, not even 16px wide. Lower --window_size.")
+            return
+        print(f"\nMax input: {size[0]}x{size[1]}, peak {peak:.2f} GiB of {total:.1f} GiB")
+        print("Headroom is thin by construction -- this is the largest size that did not "
+              "OOM, so back off a step for a real run. The peak counts torch's allocator "
+              "only, so nvidia-smi will read higher.")
+        print("GPU only: generate_depth_sliced keeps every window at full-res float32 on "
+              "the host before concatenating, so a full-length clip has a separate host "
+              "RAM ceiling that grows with frame count and --overlap.")
+        return
+
     for name, rgb in iter_clips(args):
         for (h, w), (target, bins) in size_variants(rgb, args).items():
             print(f"\n=== {name} @ {h}x{w} -> {bins}")
@@ -258,4 +378,5 @@ def main():
 if __name__ == "__main__":
     check_windows()
     check_size_variants()
+    check_largest_ok()
     main()
