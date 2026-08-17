@@ -22,11 +22,14 @@ python test_script/eval_depth_dump.py --ckpt ckpt --dataset demo/robot_navi.mp4 
 --find_max_size skips the dump: it binary-searches the widest input one window
 survives on this GPU at the configured --window_size, prints it, and exits.
 
-Each clip is predicted at five input sizes -- the training size (--height/--width),
-width 512, width 1024, width 3840 (4K, upscale-only) and the source's own size. A
-source already at one of them is not resized: that pass is shared by both bins.
+Each clip is predicted at six input sizes -- the training size (--height/--width),
+width 512, 1024, 2048, 3840 (4K, upscale-only) and the source's own size. A source
+already at one of them is not resized: that pass is shared by both bins.
 
-Output: <outputs_path>/{train,512,1024,4k,original}/{depth,rgb}/<clip name>/frame_0000.png ...
+Sizes run cheapest first. A CUDA OOM writes the frames that did finish and exits 1,
+rather than losing the clip: see --find_max_size for what this GPU actually takes.
+
+Output: <outputs_path>/{train,512,1024,2k,4k,original}/{depth,rgb}/<clip name>/frame_0000.png ...
 The rgb folder holds the exact (resized) frames that were fed to the model.
 """
 
@@ -46,18 +49,13 @@ from PIL import Image
 
 # Sibling script: sys.path[0] is test_script/ when launched as
 # `python test_script/eval_depth_dump.py` (how infer_bash/*.sh call it).
-from test_single_video import (generate_depth_sliced, get_window_index,
+from test_single_video import (generate_depth_sliced, get_window_index, is_oom,
                                load_model, read_video,
                                resize_for_training_scale)
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
 UHD_WIDTH = 3840  # the "4k" bin; 16-aligned already, DCI 4096 would be too
-
-# --find_max_size reads these as "too big". The CUDA and host allocators word it
-# differently ("CUDA out of memory" vs "DefaultCPUAllocator: can't allocate memory").
-OOM_MARKERS = ("out of memory", "can't allocate memory",
-               "cannot allocate memory", "not enough memory")
 
 # name -> (module, class). Root kwarg differs per family, see build_dataset.
 DATASETS = {
@@ -145,13 +143,16 @@ def size_variants(rgb, args):
 
     The size is probed on a 1-frame slice and only the target is returned, so
     main() resizes one clip at a time -- a 300-frame 4K variant is 30 GB.
-    4K is probed last: if it OOMs, the cheaper bins are already on disk.
+
+    Returned cheapest first (by pixel count, which is what memory tracks), so an
+    OOM only costs the sizes that were going to be bigger anyway.
     """
     H, W = rgb.shape[-2:]
     targets = {
         "train": (args.height, args.width),        # DVD's covering resize
         "512": (round(H * 512 / W), 512),
         "1024": (round(H * 1024 / W), 1024),
+        "2k": (round(H * 2048 / W), 2048),
         "original": (H, W),                        # /16 alignment only, no scaling
         # 4K upscales a smaller source but never shrinks one that is already >= 4K
         # wide -- such a source falls through to "original" and shares that pass.
@@ -163,7 +164,7 @@ def size_variants(rgb, args):
         # is not idempotent (1080p -> 1088x1920 -> 1088x1936).
         probe, _ = resize_for_training_scale(rgb[:, :1], *target)
         variants.setdefault(tuple(probe.shape[-2:]), (target, []))[1].append(name)
-    return variants
+    return dict(sorted(variants.items(), key=lambda kv: kv[0][0] * kv[0][1]))
 
 
 def save_grayscale(depth, out_dir):
@@ -225,7 +226,7 @@ def find_max_size(model, rgb, args):
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
             # Anything else is a real bug and must not read as "too big".
-            if not any(m in str(err).lower() for m in OOM_MARKERS):
+            if not is_oom(err):
                 raise
             print(f"  {label}: OOM")
             return False
@@ -244,6 +245,29 @@ def find_max_size(model, rgb, args):
 
     best = largest_ok(fits, args.max_search_width // 16)
     return seen.get(best, (None, None))
+
+
+def run_bin(model, rgb, target, args):
+    """(depth, rgb_in, frames wanted) for one size, surviving an OOM.
+
+    depth is short of `want` frames -- or None -- when CUDA (or the host, during
+    the resize) ran dry; whatever finished is still returned so main() can write
+    it before giving up.
+    """
+    rgb_in, depth = None, None
+    try:
+        rgb_in, _ = resize_for_training_scale(rgb, *target)
+        with torch.no_grad():
+            depth = generate_depth_sliced(model, rgb_in, args.window_size,
+                                          args.overlap, partial_on_oom=True)
+    except RuntimeError as err:
+        if not is_oom(err):
+            raise
+        print(f"  out of memory before any depth was computed")
+    gc.collect()
+    torch.cuda.empty_cache()
+    want = rgb.shape[1] if rgb_in is None else rgb_in.shape[1]
+    return (None if depth is None else depth[0]), rgb_in, want
 
 
 def save_rgb(rgb_in, out_dir):
@@ -319,9 +343,13 @@ def check_size_variants():
     v = size_variants(torch.zeros(1, 2, 3, 576, 1024), a)   # already the 1024 bin
     at = {b: s for s, (_, bins) in v.items() for b in bins}
     assert at == {"train": (480, 864), "512": (288, 512), "1024": (576, 1024),
-                  "4k": (2160, 3840), "original": (576, 1024)}, at
-    assert len(v) == 4, v.keys()          # 1024 + original share one inference
+                  "2k": (1152, 2048), "4k": (2160, 3840),
+                  "original": (576, 1024)}, at
+    assert len(v) == 5, v.keys()          # 1024 + original share one inference
     assert all(h % 16 == 0 and w % 16 == 0 for h, w in v), v.keys()
+    # Cheapest first, so an OOM only forfeits sizes that were bigger anyway.
+    areas = [h * w for h, w in v]
+    assert areas == sorted(areas), list(v)
 
     # A source past 4K is never shrunk to it: "4k" rides along with "original".
     v = size_variants(torch.zeros(1, 2, 3, 2160, 4096), a)
@@ -364,15 +392,25 @@ def main():
     for name, rgb in iter_clips(args):
         for (h, w), (target, bins) in size_variants(rgb, args).items():
             print(f"\n=== {name} @ {h}x{w} -> {bins}")
-            rgb_in, _ = resize_for_training_scale(rgb, *target)
-            with torch.no_grad():
-                depth = generate_depth_sliced(
-                    model, rgb_in, args.window_size, args.overlap)[0]
-            for b in bins:
-                save_grayscale(depth, out_root / b / "depth" / name)
-                save_rgb(rgb_in, out_root / b / "rgb" / name)
-            print(f"Wrote {depth.shape[0]} frames to "
-                  + ", ".join(str(out_root / b / "{depth,rgb}" / name) for b in bins))
+            depth, rgb_in, want = run_bin(model, rgb, target, args)
+            done = 0 if depth is None else depth.shape[0]
+
+            if done:
+                for b in bins:
+                    save_grayscale(depth, out_root / b / "depth" / name)
+                    save_rgb(rgb_in[:, :done], out_root / b / "rgb" / name)
+                print(f"Wrote {done} frames to "
+                      + ", ".join(str(out_root / b / "{depth,rgb}" / name) for b in bins))
+
+            if done < want:
+                # Bins run cheapest first, so every size left is bigger and would
+                # OOM the same way -- and a failing pass burns ~20 min before it
+                # gives up. Whatever finished is already on disk.
+                print(f"\nOut of memory at {h}x{w}, window_size={args.window_size}: "
+                      f"saved {done}/{want} frames of {name}, stopping.\n"
+                      f"Retry with a smaller --window_size, or run --find_max_size "
+                      f"to get the largest input this GPU takes.")
+                sys.exit(1)
 
 
 if __name__ == "__main__":
