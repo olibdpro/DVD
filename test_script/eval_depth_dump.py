@@ -26,8 +26,10 @@ Each clip is predicted at six input sizes -- the training size (--height/--width
 width 512, 1024, 2048, 3840 (4K, upscale-only) and the source's own size. A source
 already at one of them is not resized: that pass is shared by both bins.
 
-Sizes run cheapest first. A CUDA OOM writes the frames that did finish and exits 1,
-rather than losing the clip: see --find_max_size for what this GPU actually takes.
+--bins picks a subset ("--bins 2k" runs only that one; "--bins train" with
+--height/--width runs one arbitrary size). Sizes run cheapest first, and a CUDA OOM
+writes the frames that did finish and exits 1 rather than losing the clip -- see
+--find_max_size for what this GPU actually takes.
 
 Output: <outputs_path>/{train,512,1024,2k,4k,original}/{depth,rgb}/<clip name>/frame_0000.png ...
 The rgb folder holds the exact (resized) frames that were fed to the model.
@@ -56,6 +58,9 @@ from test_single_video import (generate_depth_sliced, get_window_index, is_oom,
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
 UHD_WIDTH = 3840  # the "4k" bin; 16-aligned already, DCI 4096 would be too
+
+# The ladder, for --bins. Kept in sync with size_variants by check_size_variants.
+BINS = ("train", "512", "1024", "2k", "original", "4k")
 
 # name -> (module, class). Root kwarg differs per family, see build_dataset.
 DATASETS = {
@@ -158,6 +163,9 @@ def size_variants(rgb, args):
         # wide -- such a source falls through to "original" and shares that pass.
         "4k": (round(H * max(1.0, UHD_WIDTH / W)), max(W, UHD_WIDTH)),
     }
+    if args.bins:
+        # argparse already rejected unknown names, so indexing is safe.
+        targets = {name: targets[name] for name in args.bins}
     variants = {}
     for name, target in targets.items():
         # The target itself is carried, not the probed size: resize_for_training_scale
@@ -298,6 +306,10 @@ def parse_args():
                         "shortest scene or every sample resamples (RecursionError).")
     p.add_argument("--max_frames", type=int, default=None,
                    help="truncate a folder/video to this many frames")
+    p.add_argument("--bins", nargs="+", choices=BINS, default=None,
+                   metavar="BIN",
+                   help=f"only these sizes instead of the whole ladder {BINS}; "
+                        f"'--bins train' with --height/--width runs one arbitrary size")
     p.add_argument("--window_size", type=int, default=81)
     p.add_argument("--overlap", type=int, default=21)
     p.add_argument("--find_max_size", action="store_true",
@@ -338,7 +350,7 @@ def check_largest_ok():
 
 def check_size_variants():
     """A source already at a target size must reuse that pass, not re-run it."""
-    a = argparse.Namespace(height=480, width=640)
+    a = argparse.Namespace(height=480, width=640, bins=None)
 
     v = size_variants(torch.zeros(1, 2, 3, 576, 1024), a)   # already the 1024 bin
     at = {b: s for s, (_, bins) in v.items() for b in bins}
@@ -350,6 +362,12 @@ def check_size_variants():
     # Cheapest first, so an OOM only forfeits sizes that were bigger anyway.
     areas = [h * w for h, w in v]
     assert areas == sorted(areas), list(v)
+    # --bins offers exactly the ladder, and selecting one runs only that one.
+    assert set(at) == set(BINS), (set(at) ^ set(BINS))
+    a.bins = ["2k"]
+    v = size_variants(torch.zeros(1, 2, 3, 576, 1024), a)
+    assert [bins for _, bins in v.values()] == [["2k"]], v
+    a.bins = None
 
     # A source past 4K is never shrunk to it: "4k" rides along with "original".
     v = size_variants(torch.zeros(1, 2, 3, 2160, 4096), a)
