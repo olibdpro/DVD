@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 from datetime import datetime
 
@@ -14,6 +15,21 @@ from tqdm import tqdm
 from diffsynth import save_video
 from examples.wanvideo.model_training.WanTrainingModule import \
     WanTrainingModule
+
+
+# The CUDA and host allocators word exhaustion differently:
+# "CUDA out of memory" vs "DefaultCPUAllocator: can't allocate memory".
+OOM_MARKERS = ("out of memory", "can't allocate memory",
+               "cannot allocate memory", "not enough memory")
+
+
+def is_oom(err):
+    """True if err is an allocator running dry rather than a real bug.
+
+    torch.cuda.OutOfMemoryError subclasses RuntimeError, so callers catch
+    RuntimeError and use this to decide whether to re-raise.
+    """
+    return any(m in str(err).lower() for m in OOM_MARKERS)
 
 
 # =============================
@@ -127,7 +143,12 @@ def get_window_index(T, window_size, overlap):
 # =============================
 # Core Inference
 # =============================
-def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_only=False):
+def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_only=False,
+                          partial_on_oom=False):
+    """partial_on_oom: stop at the window that ran out of memory and return the ones
+    already computed (None if the first one failed), instead of propagating. Off by
+    default -- silently short output is the wrong answer for callers writing a video.
+    """
     B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
     print(f"depth_windows {depth_windows}")
@@ -143,26 +164,42 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
         _input_frame = _input_rgb_slice.shape[1]
         _input_height, _input_width = _input_rgb_slice.shape[-2:]
 
-        outputs = model.pipe(
-            prompt=[""] * B,
-            negative_prompt=[""] * B,
-            mode=model.args.mode,
-            height=_input_height,
-            width=_input_width,
-            num_frames=_input_frame,
-            batch_size=B,
-            input_image=_input_rgb_slice[:, 0],
-            extra_images=_input_rgb_slice,
-            extra_image_frame_index=torch.ones(
-                [B, _input_frame]).to(model.pipe.device),
-            input_video=_input_rgb_slice,
-            cfg_scale=1,
-            seed=0,
-            tiled=False,
-            denoise_step=model.args.denoise_step,
-        )
+        try:
+            outputs = model.pipe(
+                prompt=[""] * B,
+                negative_prompt=[""] * B,
+                mode=model.args.mode,
+                height=_input_height,
+                width=_input_width,
+                num_frames=_input_frame,
+                batch_size=B,
+                input_image=_input_rgb_slice[:, 0],
+                extra_images=_input_rgb_slice,
+                extra_image_frame_index=torch.ones(
+                    [B, _input_frame]).to(model.pipe.device),
+                input_video=_input_rgb_slice,
+                cfg_scale=1,
+                seed=0,
+                tiled=False,
+                denoise_step=model.args.denoise_step,
+            )
+        except RuntimeError as err:
+            if not (partial_on_oom and is_oom(err)):
+                raise
+            print(f"\nOut of memory on window {start}-{end} at "
+                  f"{_input_height}x{_input_width}. Keeping the "
+                  f"{len(depth_res_list)} window(s) already computed.")
+            del _input_rgb_slice
+            # A caught OOM holds the failed graph alive through frame locals;
+            # without this the caller's save path can OOM too.
+            gc.collect()
+            torch.cuda.empty_cache()
+            break
         # Drop the padded frames
         depth_res_list.append(outputs['depth'][:, :origin_T])
+
+    if not depth_res_list:
+        return None
 
     # 2. Overlap Alignment
     depth_list_aligned = None
