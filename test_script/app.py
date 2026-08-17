@@ -34,7 +34,8 @@ def fn(input_video):
     ))
     depth = predict_depth(pipeline, input_tensor, orig_size, Namespace(
         window_size=81,
-        overlap=21
+        overlap=21,
+        tiled=False
     ))
     output_video = save_results(depth, origin_fps, Namespace(
         input_video=input_video,

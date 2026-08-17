@@ -144,10 +144,13 @@ def get_window_index(T, window_size, overlap):
 # Core Inference
 # =============================
 def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_only=False,
-                          partial_on_oom=False):
+                          partial_on_oom=False, tiled=False):
     """partial_on_oom: stop at the window that ran out of memory and return the ones
     already computed (None if the first one failed), instead of propagating. Off by
     default -- silently short output is the wrong answer for callers writing a video.
+
+    tiled: run the VAE encode/decode in tiles. Trades speed for a lower memory peak
+    without touching the window, which is the part that carries temporal context.
     """
     B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
@@ -180,7 +183,7 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
                 input_video=_input_rgb_slice,
                 cfg_scale=1,
                 seed=0,
-                tiled=False,
+                tiled=tiled,
                 denoise_step=model.args.denoise_step,
             )
         except RuntimeError as err:
@@ -315,7 +318,7 @@ def load_video_data(args):
 def predict_depth(model, input_tensor, orig_size, args):
     """Runs depth prediction and post-processes the output to original size."""
     depth = generate_depth_sliced(
-        model, input_tensor, args.window_size, args.overlap)[0]
+        model, input_tensor, args.window_size, args.overlap, tiled=args.tiled)[0]
     print(f"depth range shape {depth.min()} - {depth.max()}, shape {depth.shape}")
 
     # Post Process: resize back to original
@@ -355,6 +358,8 @@ def parse_args():
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument("--overlap", type=int, default=9)
     parser.add_argument('--grayscale', action='store_true')
+    parser.add_argument('--tiled', action='store_true',
+                        help="tile the VAE encode/decode: slower, lower memory peak")
     return parser.parse_args()
 
 

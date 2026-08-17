@@ -229,7 +229,8 @@ def find_max_size(model, rgb, args):
             h, w = rgb_in.shape[-2:]
             label = f"{h}x{w}"
             with torch.no_grad():
-                generate_depth_sliced(model, rgb_in, args.window_size, args.overlap)
+                generate_depth_sliced(model, rgb_in, args.window_size, args.overlap,
+                                      tiled=args.tiled)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -267,7 +268,8 @@ def run_bin(model, rgb, target, args):
         rgb_in, _ = resize_for_training_scale(rgb, *target)
         with torch.no_grad():
             depth = generate_depth_sliced(model, rgb_in, args.window_size,
-                                          args.overlap, partial_on_oom=True)
+                                          args.overlap, partial_on_oom=True,
+                                          tiled=args.tiled)
     except RuntimeError as err:
         if not is_oom(err):
             raise
@@ -312,6 +314,9 @@ def parse_args():
                         f"'--bins train' with --height/--width runs one arbitrary size")
     p.add_argument("--window_size", type=int, default=81)
     p.add_argument("--overlap", type=int, default=21)
+    p.add_argument("--tiled", action="store_true",
+                   help="tile the VAE encode/decode: slower, lower memory peak, so "
+                        "--find_max_size reports a bigger ceiling")
     p.add_argument("--find_max_size", action="store_true",
                    help="probe the largest input that fits this GPU at --window_size, "
                         "then exit without dumping anything")
@@ -426,8 +431,8 @@ def main():
                 # gives up. Whatever finished is already on disk.
                 print(f"\nOut of memory at {h}x{w}, window_size={args.window_size}: "
                       f"saved {done}/{want} frames of {name}, stopping.\n"
-                      f"Retry with a smaller --window_size, or run --find_max_size "
-                      f"to get the largest input this GPU takes.")
+                      f"Retry with --tiled (cheaper VAE, same window), or run "
+                      f"--find_max_size to get the largest input this GPU takes.")
                 sys.exit(1)
 
 
