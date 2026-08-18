@@ -140,21 +140,128 @@ def get_window_index(T, window_size, overlap):
     return res
 
 
+def get_spatial_tile_index(length, tile, overlap):
+    """[start, end) pairs covering [0, length), mirroring get_window_index:
+    every tile is full-size (except length <= tile) and consecutive tiles
+    overlap by at least `overlap`; the last tile is snapped to end at `length`.
+    """
+    if length <= tile:
+        return [(0, length)]
+    stride = tile - overlap
+    if stride <= 0:
+        raise ValueError(
+            f"spatial overlap ({overlap}) must be smaller than the tile ({tile})")
+    index = []
+    start = 0
+    while start + tile < length:
+        index.append((start, start + tile))
+        start += stride
+    index.append((length - tile, length))
+    return index
+
+
+def spatial_blend_mask(h, h_, w, w_, H, W, overlap_h, overlap_w):
+    """Feather weight for one tile: 1 inside, linear ramps on edges that are
+    not the frame border, so neighbouring tiles cross-fade. Same scheme as the
+    VAE's build_mask, but applied to the predicted depth instead of latents."""
+    def ramp(length, at_start_border, at_end_border, overlap):
+        overlap = min(overlap, length)
+        x = np.ones(length, dtype=np.float32)
+        if not at_start_border and overlap > 0:
+            x[:overlap] = np.arange(1, overlap + 1, dtype=np.float32) / overlap
+        if not at_end_border and overlap > 0:
+            x[-overlap:] = np.arange(overlap, 0, -1, dtype=np.float32) / overlap
+        return x
+    mask_h = ramp(h_ - h, h == 0, h_ == H, overlap_h)
+    mask_w = ramp(w_ - w, w == 0, w_ == W, overlap_w)
+    return np.minimum(mask_h[:, None], mask_w[None, :])
+
+
+def _run_pipe(model, rgb_slice, tiled):
+    """One pipeline call on a (B, T, C, H, W) slice. Spatial crops go through
+    the exact same path as full frames, so conditioning stays in-distribution."""
+    B, T, _, H, W = rgb_slice.shape
+    return model.pipe(
+        prompt=[""] * B,
+        negative_prompt=[""] * B,
+        mode=model.args.mode,
+        height=H,
+        width=W,
+        num_frames=T,
+        batch_size=B,
+        input_image=rgb_slice[:, 0],
+        extra_images=rgb_slice,
+        extra_image_frame_index=torch.ones([B, T]).to(model.pipe.device),
+        input_video=rgb_slice,
+        cfg_scale=1,
+        seed=0,
+        tiled=tiled,
+        denoise_step=model.args.denoise_step,
+    )
+
+
+def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
+                            spatial_tile, spatial_overlap):
+    """Depth for one temporal window, inferred on overlapping spatial crops and
+    feather-blended back to full frame. Each crop runs the whole pipeline
+    (VAE + DiT) on its own, so the VAE's global spatial attention stays intact
+    and the conditioning is exactly what the model saw in training -- unlike
+    `tiled`, which shards the VAE's attention across latent tiles."""
+    tile_h, tile_w = spatial_tile
+    if tile_h % 16 or tile_w % 16:
+        raise ValueError(
+            "spatial_tile must be 16-aligned (VAE 8x downsample + DiT 2x "
+            f"patchify), got {spatial_tile}")
+    _, _, _, H, W = rgb_window.shape
+    h_index = get_spatial_tile_index(H, tile_h, spatial_overlap)
+    w_index = get_spatial_tile_index(W, tile_w, spatial_overlap)
+    B = rgb_window.shape[0]
+    values, weight = None, np.zeros((H, W), dtype=np.float32)
+    for h, h_ in h_index:
+        for w, w_ in w_index:
+            outputs = _run_pipe(model, rgb_window[:, :, :, h:h_, w:w_], tiled)
+            tile_depth = outputs['depth'][:, :origin_T]
+            mask = spatial_blend_mask(h, h_, w, w_, H, W,
+                                      spatial_overlap, spatial_overlap)
+            if values is None:
+                values = np.zeros(
+                    (B, origin_T, H, W, tile_depth.shape[-1]), dtype=np.float32)
+            values[:, :, h:h_, w:w_] += tile_depth * mask[None, None, :, :, None]
+            weight[h:h_, w:w_] += mask
+    return values / weight[None, None, :, :, None]
+
+
 # =============================
 # Core Inference
 # =============================
 def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_only=False,
-                          partial_on_oom=False, tiled=False):
+                          partial_on_oom=False, tiled=False,
+                          spatial_tile=None, spatial_overlap=64):
     """partial_on_oom: stop at the window that ran out of memory and return the ones
     already computed (None if the first one failed), instead of propagating. Off by
     default -- silently short output is the wrong answer for callers writing a video.
 
     tiled: run the VAE encode/decode in tiles. Trades speed for a lower memory peak
     without touching the window, which is the part that carries temporal context.
+    Approximate: the VAE's global spatial attention is sharded per tile, which
+    visibly degrades depth output. Prefer spatial_tile.
+
+    spatial_tile: None, or (tile_h, tile_w) to infer every window as overlapping
+    spatial crops of that size, feather-blended in pixel space. The pipeline-level
+    alternative to tiled: every crop runs the full pipeline on its own, so the
+    VAE's attention and the training distribution are preserved. Crops are blended
+    raw (the model is deterministic and overlapping crops mostly agree); widen
+    spatial_overlap if seams show. Tile sizes must be 16-aligned.
     """
     B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
     print(f"depth_windows {depth_windows}")
+    if spatial_tile is not None:
+        n_h = len(get_spatial_tile_index(H, spatial_tile[0], spatial_overlap))
+        n_w = len(get_spatial_tile_index(W, spatial_tile[1], spatial_overlap))
+        print(f"spatial tiling: {n_h}x{n_w} crops of "
+              f"{spatial_tile[0]}x{spatial_tile[1]} (overlap {spatial_overlap}) "
+              f"per window")
 
     depth_res_list = []
 
@@ -164,33 +271,20 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
 
         # Ensure 4n+1 padding
         _input_rgb_slice, origin_T = pad_time_mod4(_input_rgb_slice)
-        _input_frame = _input_rgb_slice.shape[1]
-        _input_height, _input_width = _input_rgb_slice.shape[-2:]
 
         try:
-            outputs = model.pipe(
-                prompt=[""] * B,
-                negative_prompt=[""] * B,
-                mode=model.args.mode,
-                height=_input_height,
-                width=_input_width,
-                num_frames=_input_frame,
-                batch_size=B,
-                input_image=_input_rgb_slice[:, 0],
-                extra_images=_input_rgb_slice,
-                extra_image_frame_index=torch.ones(
-                    [B, _input_frame]).to(model.pipe.device),
-                input_video=_input_rgb_slice,
-                cfg_scale=1,
-                seed=0,
-                tiled=tiled,
-                denoise_step=model.args.denoise_step,
-            )
+            if spatial_tile is None:
+                outputs = _run_pipe(model, _input_rgb_slice, tiled)
+                depth_window = outputs['depth'][:, :origin_T]
+            else:
+                depth_window = _run_pipe_spatial_tiled(
+                    model, _input_rgb_slice, origin_T, tiled,
+                    spatial_tile, spatial_overlap)
         except RuntimeError as err:
             if not (partial_on_oom and is_oom(err)):
                 raise
             print(f"\nOut of memory on window {start}-{end} at "
-                  f"{_input_height}x{_input_width}. Keeping the "
+                  f"{H}x{W}. Keeping the "
                   f"{len(depth_res_list)} window(s) already computed.")
             del _input_rgb_slice
             # A caught OOM holds the failed graph alive through frame locals;
@@ -199,7 +293,7 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
             torch.cuda.empty_cache()
             break
         # Drop the padded frames
-        depth_res_list.append(outputs['depth'][:, :origin_T])
+        depth_res_list.append(depth_window)
 
     if not depth_res_list:
         return None
@@ -318,7 +412,9 @@ def load_video_data(args):
 def predict_depth(model, input_tensor, orig_size, args):
     """Runs depth prediction and post-processes the output to original size."""
     depth = generate_depth_sliced(
-        model, input_tensor, args.window_size, args.overlap, tiled=args.tiled)[0]
+        model, input_tensor, args.window_size, args.overlap, tiled=args.tiled,
+        spatial_tile=args.spatial_tile,
+        spatial_overlap=args.spatial_tile_overlap)[0]
     print(f"depth range shape {depth.min()} - {depth.max()}, shape {depth.shape}")
 
     # Post Process: resize back to original
@@ -359,7 +455,17 @@ def parse_args():
     parser.add_argument("--overlap", type=int, default=9)
     parser.add_argument('--grayscale', action='store_true')
     parser.add_argument('--tiled', action='store_true',
-                        help="tile the VAE encode/decode: slower, lower memory peak")
+                        help="tile the VAE encode/decode: slower, lower memory peak, "
+                             "but degrades output (per-tile VAE attention); "
+                             "--spatial_tile is the quality-preserving alternative")
+    parser.add_argument('--spatial_tile', type=int, nargs=2, default=None,
+                        metavar=('H', 'W'),
+                        help="pipeline-level spatial tiling: run each temporal window "
+                             "as overlapping HxW crops and feather-blend the depth. "
+                             "Unlike --tiled, the VAE stays whole per crop, so output "
+                             "quality is preserved. H W must be 16-aligned.")
+    parser.add_argument('--spatial_tile_overlap', type=int, default=64,
+                        help="feather width between spatial crops in pixels")
     return parser.parse_args()
 
 

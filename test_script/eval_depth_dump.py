@@ -51,9 +51,9 @@ from PIL import Image
 
 # Sibling script: sys.path[0] is test_script/ when launched as
 # `python test_script/eval_depth_dump.py` (how infer_bash/*.sh call it).
-from test_single_video import (generate_depth_sliced, get_window_index, is_oom,
-                               load_model, read_video,
-                               resize_for_training_scale)
+from test_single_video import (generate_depth_sliced, get_spatial_tile_index,
+                               get_window_index, is_oom, load_model, read_video,
+                               resize_for_training_scale, spatial_blend_mask)
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
@@ -230,7 +230,8 @@ def find_max_size(model, rgb, args):
             label = f"{h}x{w}"
             with torch.no_grad():
                 generate_depth_sliced(model, rgb_in, args.window_size, args.overlap,
-                                      tiled=args.tiled)
+                                      tiled=args.tiled, spatial_tile=args.spatial_tile,
+                                      spatial_overlap=args.spatial_tile_overlap)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -269,7 +270,9 @@ def run_bin(model, rgb, target, args):
         with torch.no_grad():
             depth = generate_depth_sliced(model, rgb_in, args.window_size,
                                           args.overlap, partial_on_oom=True,
-                                          tiled=args.tiled)
+                                          tiled=args.tiled,
+                                          spatial_tile=args.spatial_tile,
+                                          spatial_overlap=args.spatial_tile_overlap)
     except RuntimeError as err:
         if not is_oom(err):
             raise
@@ -316,7 +319,16 @@ def parse_args():
     p.add_argument("--overlap", type=int, default=21)
     p.add_argument("--tiled", action="store_true",
                    help="tile the VAE encode/decode: slower, lower memory peak, so "
-                        "--find_max_size reports a bigger ceiling")
+                        "--find_max_size reports a bigger ceiling (degrades output: "
+                        "per-tile VAE attention; --spatial_tile keeps quality)")
+    p.add_argument("--spatial_tile", type=int, nargs=2, default=None,
+                   metavar=("H", "W"),
+                   help="pipeline-level spatial tiling: run each temporal window as "
+                        "overlapping HxW crops and feather-blend the depth. Unlike "
+                        "--tiled, the VAE stays whole per crop, so output quality is "
+                        "preserved. H W must be 16-aligned.")
+    p.add_argument("--spatial_tile_overlap", type=int, default=64,
+                   help="feather width between spatial crops in pixels")
     p.add_argument("--find_max_size", action="store_true",
                    help="probe the largest input that fits this GPU at --window_size, "
                         "then exit without dumping anything")
@@ -338,6 +350,31 @@ def check_windows():
         assert all(w[i + 1][0] <= w[i][1] for i in range(len(w) - 1)), w
         if T > 81:
             assert all(b - a == 81 for a, b in w), w
+
+
+def check_spatial_tiles():
+    """Spatial tiles must cover [0, L) with positive blend weight everywhere,
+    and feather-blending a constant must return the constant."""
+    for L, tile, ov in ((100, 60, 20), (64, 64, 16), (50, 60, 20), (37, 32, 8),
+                        (640, 480, 100)):
+        idx = get_spatial_tile_index(L, tile, ov)
+        assert idx[0][0] == 0 and idx[-1][1] == L, (L, tile, ov, idx)
+        assert all(b > a for a, b in idx), idx
+        # Chained: consecutive tiles strictly overlap, so masks can cross-fade.
+        assert all(idx[i + 1][0] < idx[i][1] for i in range(len(idx) - 1)), idx
+        if L > tile:
+            assert all(b - a == tile for a, b in idx), idx
+    for H, W, th, tw, ov in ((100, 130, 60, 60, 20), (480, 640, 480, 640, 64),
+                             (37, 51, 32, 32, 8), (480, 640, 256, 320, 64)):
+        weight = np.zeros((H, W), dtype=np.float32)
+        values = np.zeros((H, W), dtype=np.float32)
+        for h, h_ in get_spatial_tile_index(H, th, ov):
+            for w, w_ in get_spatial_tile_index(W, tw, ov):
+                m = spatial_blend_mask(h, h_, w, w_, H, W, ov, ov)
+                weight[h:h_, w:w_] += m
+                values[h:h_, w:w_] += 3.14 * m
+        assert weight.min() > 0, (H, W, th, tw, ov)
+        assert np.allclose(values / weight, 3.14, atol=1e-5), (H, W, th, tw, ov)
 
 
 def check_largest_ok():
@@ -431,13 +468,15 @@ def main():
                 # gives up. Whatever finished is already on disk.
                 print(f"\nOut of memory at {h}x{w}, window_size={args.window_size}: "
                       f"saved {done}/{want} frames of {name}, stopping.\n"
-                      f"Retry with --tiled (cheaper VAE, same window), or run "
+                      f"Retry with --spatial_tile H W (spatial crops, quality kept), "
+                      f"or --tiled (cheaper VAE, degrades output), or run "
                       f"--find_max_size to get the largest input this GPU takes.")
                 sys.exit(1)
 
 
 if __name__ == "__main__":
     check_windows()
+    check_spatial_tiles()
     check_size_variants()
     check_largest_ok()
     main()
