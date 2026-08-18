@@ -677,9 +677,7 @@ class WanVideoVAE(nn.Module):
 
             target_h = h * self.upsampling_factor
             target_w = w * self.upsampling_factor
-            import pdb
 
-            # pdb.set_trace()
             values[
                 :,
                 :,
@@ -768,12 +766,15 @@ class WanVideoVAE(nn.Module):
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
 
         # videos = [video.to("cpu") for video in videos]
+        if tiled:
+            # Latent units -> pixel units, once. Doing this inside the loop
+            # re-scales on every clip: batch #2 would get tile_size * 64.
+            tile_size = (tile_size[0] * 8, tile_size[1] * 8)
+            tile_stride = (tile_stride[0] * 8, tile_stride[1] * 8)
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)
             if tiled:
-                tile_size = (tile_size[0] * 8, tile_size[1] * 8)
-                tile_stride = (tile_stride[0] * 8, tile_stride[1] * 8)
                 hidden_state = self.tiled_encode(
                     video, device, tile_size, tile_stride)
             else:

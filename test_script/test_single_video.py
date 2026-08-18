@@ -13,6 +13,7 @@ from safetensors.torch import load_file
 from tqdm import tqdm
 
 from diffsynth import save_video
+from diffsynth.pipelines.wan_video_new_determine import SpatialTiler_BCTHW
 from examples.wanvideo.model_training.WanTrainingModule import \
     WanTrainingModule
 
@@ -177,13 +178,17 @@ def spatial_blend_mask(h, h_, w, w_, H, W, overlap_h, overlap_w):
     return np.minimum(mask_h[:, None], mask_w[None, :])
 
 
-def _run_pipe(model, rgb_slice, tiled, tile_size=None, tile_stride=None):
+def _run_pipe(model, rgb_slice, tiled, tile_size=None, tile_stride=None,
+              latent_tile=None, latent_tile_overlap=8):
     """One pipeline call on a (B, T, C, H, W) slice. Spatial crops go through
     the exact same path as full frames, so conditioning stays in-distribution."""
     B, T, _, H, W = rgb_slice.shape
     # Omitted when unset so the pipeline's own tile defaults stay authoritative.
-    tile_kwargs = {k: tuple(v) for k, v in (("tile_size", tile_size),
-                                            ("tile_stride", tile_stride)) if v}
+    tile_kwargs: dict = {k: tuple(v) for k, v in (("tile_size", tile_size),
+                                                  ("tile_stride", tile_stride)) if v}
+    if latent_tile is not None:
+        tile_kwargs["latent_tile_size"] = tuple(latent_tile)
+        tile_kwargs["latent_tile_overlap"] = latent_tile_overlap
     return model.pipe(
         prompt=[""] * B,
         negative_prompt=[""] * B,
@@ -206,7 +211,8 @@ def _run_pipe(model, rgb_slice, tiled, tile_size=None, tile_stride=None):
 
 def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
                             spatial_tile, spatial_overlap,
-                            tile_size=None, tile_stride=None):
+                            tile_size=None, tile_stride=None,
+                            latent_tile=None, latent_tile_overlap=8):
     """Depth for one temporal window, inferred on overlapping spatial crops and
     feather-blended back to full frame. Each crop runs the whole pipeline
     (VAE + DiT) on its own, so the VAE's global spatial attention stays intact
@@ -225,7 +231,8 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
     for h, h_ in h_index:
         for w, w_ in w_index:
             outputs = _run_pipe(model, rgb_window[:, :, :, h:h_, w:w_], tiled,
-                                tile_size, tile_stride)
+                                tile_size, tile_stride,
+                                latent_tile, latent_tile_overlap)
             tile_depth = outputs['depth'][:, :origin_T]
             mask = spatial_blend_mask(h, h_, w, w_, H, W,
                                       spatial_overlap, spatial_overlap)
@@ -258,13 +265,30 @@ def check_vae_tile(tile_size, tile_stride, tiled=True):
               "is off; ignoring them. (--spatial_tile has its own geometry.)")
 
 
+def check_latent_tile(latent_tile, latent_tile_overlap):
+    """Reject latent-tile geometry the DiT cannot patchify or the tiler cannot cover."""
+    if latent_tile is None:
+        return
+    if min(latent_tile) < 2 or any(t % 2 for t in latent_tile):
+        raise ValueError(f"--latent_tile {tuple(latent_tile)} must be positive and "
+                         "even (the DiT patchifies 2x2; odd tiles lose a row/column)")
+    if latent_tile_overlap < 0 or latent_tile_overlap % 2:
+        raise ValueError(f"--latent_tile_overlap {latent_tile_overlap} must be even "
+                         "and non-negative (an odd overlap gives odd tile starts)")
+    if latent_tile_overlap >= min(latent_tile):
+        # stride = size - overlap would be <= 0: the tile loop would never advance.
+        raise ValueError(f"--latent_tile_overlap {latent_tile_overlap} must be "
+                         f"smaller than --latent_tile {tuple(latent_tile)}")
+
+
 # =============================
 # Core Inference
 # =============================
 def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_only=False,
                           partial_on_oom=False, tiled=False,
                           spatial_tile=None, spatial_overlap=64,
-                          tile_size=None, tile_stride=None):
+                          tile_size=None, tile_stride=None,
+                          latent_tile=None, latent_tile_overlap=8):
     """partial_on_oom: stop at the window that ran out of memory and return the ones
     already computed (None if the first one failed), instead of propagating. Off by
     default -- silently short output is the wrong answer for callers writing a video.
@@ -284,11 +308,30 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
     tile_size/tile_stride: the VAE tile geometry `tiled` uses, in latent units
     (1 unit = 8 px). Left None, the pipeline's own defaults apply. Smaller tiles
     lower the peak further; a shorter stride widens the blend seam.
+
+    latent_tile: None, or (tile_h, tile_w) in latent units (1 unit = 8 px) to run
+    the DiT on overlapping spatial tiles of the latent and feather-blend the
+    predicted depth latents, followed by one global VAE decode. This shrinks the
+    DiT memory peak (tokens scale with tile area) -- the part that OOMs at large
+    inputs -- while temporal context and the VAE's attention both stay whole,
+    unlike `tiled` (per-tile VAE attention) or a smaller window (less temporal
+    context). Tiles must be even (DiT patchify is 2x2). Each tile builds its own
+    0-based RoPE, which under independent per-tile passes is identical to sliced
+    global coordinates, so no positional handling is needed.
+    latent_tile_overlap: feather width between latent tiles, in latent units;
+    even and smaller than the tile (default 8 = 64 px).
     """
     check_vae_tile(tile_size, tile_stride, tiled)
+    check_latent_tile(latent_tile, latent_tile_overlap)
     B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
     print(f"depth_windows {depth_windows}")
+    if latent_tile is not None:
+        lh, lw = latent_tile
+        n_h = len(SpatialTiler_BCTHW.tile_index(H // 8, lh, lh - latent_tile_overlap))
+        n_w = len(SpatialTiler_BCTHW.tile_index(W // 8, lw, lw - latent_tile_overlap))
+        print(f"latent tiling: {n_h}x{n_w} DiT tiles of {lh}x{lw} latents "
+              f"(overlap {latent_tile_overlap}) per window")
     if spatial_tile is not None:
         n_h = len(get_spatial_tile_index(H, spatial_tile[0], spatial_overlap))
         n_w = len(get_spatial_tile_index(W, spatial_tile[1], spatial_overlap))
@@ -308,12 +351,14 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
         try:
             if spatial_tile is None:
                 outputs = _run_pipe(model, _input_rgb_slice, tiled,
-                                    tile_size, tile_stride)
+                                    tile_size, tile_stride,
+                                    latent_tile, latent_tile_overlap)
                 depth_window = outputs['depth'][:, :origin_T]
             else:
                 depth_window = _run_pipe_spatial_tiled(
                     model, _input_rgb_slice, origin_T, tiled,
-                    spatial_tile, spatial_overlap, tile_size, tile_stride)
+                    spatial_tile, spatial_overlap, tile_size, tile_stride,
+                    latent_tile, latent_tile_overlap)
         except RuntimeError as err:
             if not (partial_on_oom and is_oom(err)):
                 raise
@@ -449,7 +494,9 @@ def predict_depth(model, input_tensor, orig_size, args):
         model, input_tensor, args.window_size, args.overlap, tiled=args.tiled,
         spatial_tile=args.spatial_tile,
         spatial_overlap=args.spatial_tile_overlap,
-        tile_size=args.tile_size, tile_stride=args.tile_stride)[0]
+        tile_size=args.tile_size, tile_stride=args.tile_stride,
+        latent_tile=args.latent_tile,
+        latent_tile_overlap=args.latent_tile_overlap)[0]
     print(f"depth range shape {depth.min()} - {depth.max()}, shape {depth.shape}")
 
     # Post Process: resize back to original
@@ -511,6 +558,18 @@ def parse_args():
                              "quality is preserved. H W must be 16-aligned.")
     parser.add_argument('--spatial_tile_overlap', type=int, default=64,
                         help="feather width between spatial crops in pixels")
+    parser.add_argument('--latent_tile', '--latent-tile', type=int, nargs=2,
+                        default=None, metavar=('H', 'W'),
+                        help="run the DiT on overlapping HxW tiles of the latent "
+                             "(1 unit = 8 px) and feather-blend the depth latents "
+                             "before one global VAE decode. Shrinks the DiT peak -- "
+                             "what OOMs at large sizes -- while temporal context and "
+                             "the VAE both stay whole (unlike --tiled). H W must be "
+                             "even. Combine with --tiled to bound the VAE too.")
+    parser.add_argument('--latent_tile_overlap', '--latent-tile-overlap', type=int,
+                        default=8, metavar='N',
+                        help="feather width between latent tiles, in latent units; "
+                             "even and < --latent_tile. Default 8 (= 64 px).")
     return parser.parse_args()
 
 

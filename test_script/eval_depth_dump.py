@@ -51,10 +51,11 @@ from PIL import Image
 
 # Sibling script: sys.path[0] is test_script/ when launched as
 # `python test_script/eval_depth_dump.py` (how infer_bash/*.sh call it).
-from test_single_video import (check_vae_tile, generate_depth_sliced,
-                               get_spatial_tile_index, get_window_index, is_oom,
-                               load_model, read_video, resize_for_training_scale,
-                               spatial_blend_mask)
+from test_single_video import (check_latent_tile, check_vae_tile,
+                               generate_depth_sliced, get_spatial_tile_index,
+                               get_window_index, is_oom, load_model, read_video,
+                               resize_for_training_scale, spatial_blend_mask)
+from diffsynth.pipelines.wan_video_new_determine import SpatialTiler_BCTHW
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
@@ -234,7 +235,9 @@ def find_max_size(model, rgb, args):
                                       tiled=args.tiled, spatial_tile=args.spatial_tile,
                                       spatial_overlap=args.spatial_tile_overlap,
                                       tile_size=args.tile_size,
-                                      tile_stride=args.tile_stride)
+                                      tile_stride=args.tile_stride,
+                                      latent_tile=args.latent_tile,
+                                      latent_tile_overlap=args.latent_tile_overlap)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -277,7 +280,9 @@ def run_bin(model, rgb, target, args):
                                           spatial_tile=args.spatial_tile,
                                           spatial_overlap=args.spatial_tile_overlap,
                                           tile_size=args.tile_size,
-                                          tile_stride=args.tile_stride)
+                                          tile_stride=args.tile_stride,
+                                          latent_tile=args.latent_tile,
+                                          latent_tile_overlap=args.latent_tile_overlap)
     except RuntimeError as err:
         if not is_oom(err):
             raise
@@ -344,6 +349,18 @@ def parse_args():
                         "preserved. H W must be 16-aligned.")
     p.add_argument("--spatial_tile_overlap", type=int, default=64,
                    help="feather width between spatial crops in pixels")
+    p.add_argument("--latent_tile", "--latent-tile", type=int, nargs=2, default=None,
+                   metavar=("H", "W"),
+                   help="run the DiT on overlapping HxW tiles of the latent (1 unit "
+                        "= 8 px) and feather-blend the depth latents before one "
+                        "global VAE decode. Shrinks the DiT peak -- what OOMs at "
+                        "large sizes -- while temporal context and the VAE both "
+                        "stay whole (unlike --tiled). H W must be even. Combine "
+                        "with --tiled to bound the VAE too.")
+    p.add_argument("--latent_tile_overlap", "--latent-tile-overlap", type=int,
+                   default=8, metavar="N",
+                   help="feather width between latent tiles, in latent units; even "
+                        "and < --latent_tile. Default 8 (= 64 px).")
     p.add_argument("--find_max_size", action="store_true",
                    help="probe the largest input that fits this GPU at --window_size, "
                         "then exit without dumping anything")
@@ -405,6 +422,45 @@ def check_vae_tile_args():
         except ValueError:
             continue
         raise AssertionError(bad)
+
+
+def check_latent_tile_args():
+    """Latent tiler: coverage with no gaps, exact blending, strict validation."""
+    check_latent_tile(None, 8)                    # off
+    check_latent_tile((34, 64), 8)                # normal
+    check_latent_tile((34, 64), 0)                # touching tiles
+    for bad in (((34, 64), 34),                   # overlap eats the tile (stride 0)
+                ((31, 64), 8),                    # odd tile breaks 2x2 patchify
+                ((34, 64), 7),                    # odd overlap -> odd tile starts
+                ((0, 64), 8)):                    # empty tile loop
+        try:
+            check_latent_tile(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+    tiler = SpatialTiler_BCTHW()
+    for L, size, ov in ((64, 34, 16), (34, 34, 8), (50, 34, 16), (37, 32, 8),
+                        (270, 34, 16), (480, 64, 32), (20, 34, 8)):
+        idx = tiler.tile_index(L, size, size - ov)
+        assert idx[0][0] == 0 and idx[-1][1] == L, (L, size, ov, idx)
+        assert all(b > a for a, b in idx), idx
+        if ov > 0 and len(idx) > 1:
+            # Chained: consecutive tiles strictly overlap, so masks cross-fade.
+            assert all(idx[i + 1][0] < idx[i][1] for i in range(len(idx) - 1)), idx
+    # Feather-blending a constant returns the constant; identity returns the input.
+    for H, W, th, tw, ov in ((64, 96, 34, 34, 16), (37, 51, 32, 32, 8),
+                             (270, 480, 34, 64, 16), (20, 20, 34, 34, 8),
+                             (64, 96, 32, 32, 0)):
+        latents = torch.randn(1, 4, 3, H, W)
+        kwargs = dict(model_kwargs={"latents": latents}, tensor_names=["latents"])
+        out = tiler.run(lambda **kw: kw["latents"], (th, tw), ov,
+                        latents.device, latents.dtype, **kwargs)
+        assert torch.allclose(out, latents, atol=1e-4), (H, W, th, tw, ov)
+        out = tiler.run(lambda **kw: torch.full_like(kw["latents"], 3.14),
+                        (th, tw), ov, latents.device, latents.dtype, **kwargs)
+        assert torch.allclose(out, torch.full_like(latents, 3.14), atol=1e-3), \
+            (H, W, th, tw, ov)
 
 
 def check_largest_ok():
@@ -496,11 +552,24 @@ def main():
                 # Bins run cheapest first, so every size left is bigger and would
                 # OOM the same way -- and a failing pass burns ~20 min before it
                 # gives up. Whatever finished is already on disk.
+                tips = []
+                if args.latent_tile is None:
+                    tips.append("--latent_tile H W (DiT on latent tiles, one global "
+                                "VAE decode, temporal context kept)")
+                if args.spatial_tile is None:
+                    tips.append("--spatial_tile H W (spatial crops, quality kept)")
+                if not args.tiled:
+                    tips.append("--tiled (cheaper VAE, degrades output)")
+                tips.append("--find_max_size to get the largest input this GPU takes")
+                note = ("\nNote: --tiled was on -- it only shrinks the VAE. The peak "
+                        "at large sizes is the DiT forward (tokens grow with H*W*T), "
+                        "which only --latent_tile, --spatial_tile or a smaller "
+                        "--window_size reduces."
+                        if args.tiled and args.latent_tile is None
+                        and args.spatial_tile is None else "")
                 print(f"\nOut of memory at {h}x{w}, window_size={args.window_size}: "
-                      f"saved {done}/{want} frames of {name}, stopping.\n"
-                      f"Retry with --spatial_tile H W (spatial crops, quality kept), "
-                      f"or --tiled (cheaper VAE, degrades output), or run "
-                      f"--find_max_size to get the largest input this GPU takes.")
+                      f"saved {done}/{want} frames of {name}, stopping.{note}\n"
+                      f"Retry with {', or '.join(tips)}.")
                 sys.exit(1)
 
 
@@ -510,4 +579,5 @@ if __name__ == "__main__":
     check_size_variants()
     check_largest_ok()
     check_vae_tile_args()
+    check_latent_tile_args()
     main()
