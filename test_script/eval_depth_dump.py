@@ -51,9 +51,10 @@ from PIL import Image
 
 # Sibling script: sys.path[0] is test_script/ when launched as
 # `python test_script/eval_depth_dump.py` (how infer_bash/*.sh call it).
-from test_single_video import (generate_depth_sliced, get_spatial_tile_index,
-                               get_window_index, is_oom, load_model, read_video,
-                               resize_for_training_scale, spatial_blend_mask)
+from test_single_video import (check_vae_tile, generate_depth_sliced,
+                               get_spatial_tile_index, get_window_index, is_oom,
+                               load_model, read_video, resize_for_training_scale,
+                               spatial_blend_mask)
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
 
@@ -231,7 +232,9 @@ def find_max_size(model, rgb, args):
             with torch.no_grad():
                 generate_depth_sliced(model, rgb_in, args.window_size, args.overlap,
                                       tiled=args.tiled, spatial_tile=args.spatial_tile,
-                                      spatial_overlap=args.spatial_tile_overlap)
+                                      spatial_overlap=args.spatial_tile_overlap,
+                                      tile_size=args.tile_size,
+                                      tile_stride=args.tile_stride)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -272,7 +275,9 @@ def run_bin(model, rgb, target, args):
                                           args.overlap, partial_on_oom=True,
                                           tiled=args.tiled,
                                           spatial_tile=args.spatial_tile,
-                                          spatial_overlap=args.spatial_tile_overlap)
+                                          spatial_overlap=args.spatial_tile_overlap,
+                                          tile_size=args.tile_size,
+                                          tile_stride=args.tile_stride)
     except RuntimeError as err:
         if not is_oom(err):
             raise
@@ -321,6 +326,16 @@ def parse_args():
                    help="tile the VAE encode/decode: slower, lower memory peak, so "
                         "--find_max_size reports a bigger ceiling (degrades output: "
                         "per-tile VAE attention; --spatial_tile keeps quality)")
+    p.add_argument("--tile_size", type=int, nargs=2, default=None,
+                   metavar=("H", "W"),
+                   help="VAE tile geometry for --tiled, in latent units (1 unit = "
+                        "8 px). Default: the pipeline's own (30 52). Smaller tiles "
+                        "lower the peak further, so --find_max_size reports more.")
+    p.add_argument("--tile_stride", type=int, nargs=2, default=None,
+                   metavar=("H", "W"),
+                   help="step between VAE tiles, in latent units; must be <= "
+                        "--tile_size, and is required alongside it. "
+                        "Default: the pipeline's own (15 26).")
     p.add_argument("--spatial_tile", type=int, nargs=2, default=None,
                    metavar=("H", "W"),
                    help="pipeline-level spatial tiling: run each temporal window as "
@@ -375,6 +390,21 @@ def check_spatial_tiles():
                 values[h:h_, w:w_] += 3.14 * m
         assert weight.min() > 0, (H, W, th, tw, ov)
         assert np.allclose(values / weight, 3.14, atol=1e-5), (H, W, th, tw, ov)
+
+
+def check_vae_tile_args():
+    """Geometry the VAE covers fully passes; anything leaving a gap must not."""
+    check_vae_tile(None, None)                    # pipeline defaults
+    check_vae_tile((30, 52), (15, 26))            # the pipeline's own values
+    check_vae_tile((34, 64), (34, 64))            # stride == size: touching, no gap
+    for bad in (((30, 52), None), (None, (15, 26)),   # one without the other
+                ((30, 52), (31, 26)), ((30, 52), (15, 53)),   # stride past the tile
+                ((30, 52), (-1, 26)), ((0, 52), (15, 26))):   # empty tile loop
+        try:
+            check_vae_tile(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
 
 
 def check_largest_ok():
@@ -479,4 +509,5 @@ if __name__ == "__main__":
     check_spatial_tiles()
     check_size_variants()
     check_largest_ok()
+    check_vae_tile_args()
     main()

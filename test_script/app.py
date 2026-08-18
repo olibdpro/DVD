@@ -36,6 +36,8 @@ def fn(input_video):
         window_size=81,
         overlap=21,
         tiled=False,
+        tile_size=None,
+        tile_stride=None,
         spatial_tile=None,
         spatial_tile_overlap=64,
     ))

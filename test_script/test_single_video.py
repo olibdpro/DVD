@@ -177,10 +177,13 @@ def spatial_blend_mask(h, h_, w, w_, H, W, overlap_h, overlap_w):
     return np.minimum(mask_h[:, None], mask_w[None, :])
 
 
-def _run_pipe(model, rgb_slice, tiled):
+def _run_pipe(model, rgb_slice, tiled, tile_size=None, tile_stride=None):
     """One pipeline call on a (B, T, C, H, W) slice. Spatial crops go through
     the exact same path as full frames, so conditioning stays in-distribution."""
     B, T, _, H, W = rgb_slice.shape
+    # Omitted when unset so the pipeline's own tile defaults stay authoritative.
+    tile_kwargs = {k: tuple(v) for k, v in (("tile_size", tile_size),
+                                            ("tile_stride", tile_stride)) if v}
     return model.pipe(
         prompt=[""] * B,
         negative_prompt=[""] * B,
@@ -196,12 +199,14 @@ def _run_pipe(model, rgb_slice, tiled):
         cfg_scale=1,
         seed=0,
         tiled=tiled,
+        **tile_kwargs,
         denoise_step=model.args.denoise_step,
     )
 
 
 def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
-                            spatial_tile, spatial_overlap):
+                            spatial_tile, spatial_overlap,
+                            tile_size=None, tile_stride=None):
     """Depth for one temporal window, inferred on overlapping spatial crops and
     feather-blended back to full frame. Each crop runs the whole pipeline
     (VAE + DiT) on its own, so the VAE's global spatial attention stays intact
@@ -219,7 +224,8 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
     values, weight = None, np.zeros((H, W), dtype=np.float32)
     for h, h_ in h_index:
         for w, w_ in w_index:
-            outputs = _run_pipe(model, rgb_window[:, :, :, h:h_, w:w_], tiled)
+            outputs = _run_pipe(model, rgb_window[:, :, :, h:h_, w:w_], tiled,
+                                tile_size, tile_stride)
             tile_depth = outputs['depth'][:, :origin_T]
             mask = spatial_blend_mask(h, h_, w, w_, H, W,
                                       spatial_overlap, spatial_overlap)
@@ -231,12 +237,34 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
     return values / weight[None, None, :, :, None]
 
 
+def check_vae_tile(tile_size, tile_stride, tiled=True):
+    """Reject VAE tile geometry the VAE would silently turn into NaN."""
+    if (tile_size is None) != (tile_stride is None):
+        raise ValueError("tile_size and tile_stride must be given together -- "
+                         "one alone can end up larger than the other's default")
+    if tile_size is None:
+        return
+    if min(tile_size) < 1 or min(tile_stride) < 1:
+        raise ValueError(f"tile_size {tuple(tile_size)} and tile_stride "
+                         f"{tuple(tile_stride)} must be positive")
+    if tile_stride[0] > tile_size[0] or tile_stride[1] > tile_size[1]:
+        # tiled_encode/decode step by stride and cover size, so a stride past
+        # the tile leaves latents no tile reaches; their blend weight stays 0
+        # and the divide at the end turns them into NaN.
+        raise ValueError(f"tile_stride {tuple(tile_stride)} must not exceed "
+                         f"tile_size {tuple(tile_size)}")
+    if not tiled:
+        print("Warning: --tile_size/--tile_stride only apply to --tiled, which "
+              "is off; ignoring them. (--spatial_tile has its own geometry.)")
+
+
 # =============================
 # Core Inference
 # =============================
 def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_only=False,
                           partial_on_oom=False, tiled=False,
-                          spatial_tile=None, spatial_overlap=64):
+                          spatial_tile=None, spatial_overlap=64,
+                          tile_size=None, tile_stride=None):
     """partial_on_oom: stop at the window that ran out of memory and return the ones
     already computed (None if the first one failed), instead of propagating. Off by
     default -- silently short output is the wrong answer for callers writing a video.
@@ -252,7 +280,12 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
     VAE's attention and the training distribution are preserved. Crops are blended
     raw (the model is deterministic and overlapping crops mostly agree); widen
     spatial_overlap if seams show. Tile sizes must be 16-aligned.
+
+    tile_size/tile_stride: the VAE tile geometry `tiled` uses, in latent units
+    (1 unit = 8 px). Left None, the pipeline's own defaults apply. Smaller tiles
+    lower the peak further; a shorter stride widens the blend seam.
     """
+    check_vae_tile(tile_size, tile_stride, tiled)
     B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
     print(f"depth_windows {depth_windows}")
@@ -274,12 +307,13 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
 
         try:
             if spatial_tile is None:
-                outputs = _run_pipe(model, _input_rgb_slice, tiled)
+                outputs = _run_pipe(model, _input_rgb_slice, tiled,
+                                    tile_size, tile_stride)
                 depth_window = outputs['depth'][:, :origin_T]
             else:
                 depth_window = _run_pipe_spatial_tiled(
                     model, _input_rgb_slice, origin_T, tiled,
-                    spatial_tile, spatial_overlap)
+                    spatial_tile, spatial_overlap, tile_size, tile_stride)
         except RuntimeError as err:
             if not (partial_on_oom and is_oom(err)):
                 raise
@@ -414,7 +448,8 @@ def predict_depth(model, input_tensor, orig_size, args):
     depth = generate_depth_sliced(
         model, input_tensor, args.window_size, args.overlap, tiled=args.tiled,
         spatial_tile=args.spatial_tile,
-        spatial_overlap=args.spatial_tile_overlap)[0]
+        spatial_overlap=args.spatial_tile_overlap,
+        tile_size=args.tile_size, tile_stride=args.tile_stride)[0]
     print(f"depth range shape {depth.min()} - {depth.max()}, shape {depth.shape}")
 
     # Post Process: resize back to original
@@ -458,6 +493,16 @@ def parse_args():
                         help="tile the VAE encode/decode: slower, lower memory peak, "
                              "but degrades output (per-tile VAE attention); "
                              "--spatial_tile is the quality-preserving alternative")
+    parser.add_argument('--tile_size', type=int, nargs=2, default=None,
+                        metavar=('H', 'W'),
+                        help="VAE tile geometry for --tiled, in latent units "
+                             "(1 unit = 8 px). Default: the pipeline's own (30 52). "
+                             "Smaller tiles lower the memory peak further.")
+    parser.add_argument('--tile_stride', type=int, nargs=2, default=None,
+                        metavar=('H', 'W'),
+                        help="step between VAE tiles, in latent units; must be <= "
+                             "--tile_size, and is required alongside it. "
+                             "Default: the pipeline's own (15 26).")
     parser.add_argument('--spatial_tile', type=int, nargs=2, default=None,
                         metavar=('H', 'W'),
                         help="pipeline-level spatial tiling: run each temporal window "
