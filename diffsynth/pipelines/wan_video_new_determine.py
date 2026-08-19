@@ -8,6 +8,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 # from modelscope import snapshot_download
 from huggingface_hub import snapshot_download
@@ -714,6 +715,7 @@ class WanVideoPipeline(BasePipeline):
         # DiT latent tiling
         latent_tile_size: Optional[tuple[int, int]] = None,
         latent_tile_overlap: Optional[int] = 8,
+        latent_ref_size: Optional[tuple[int, int]] = None,
         # Sliding window
         sliding_window_size: Optional[int] = None,
         sliding_window_stride: Optional[int] = None,
@@ -773,6 +775,7 @@ class WanVideoPipeline(BasePipeline):
             "tile_stride": tile_stride,
             "latent_tile_size": latent_tile_size,
             "latent_tile_overlap": latent_tile_overlap,
+            "latent_ref_size": latent_ref_size,
             "sliding_window_size": sliding_window_size,
             "sliding_window_stride": sliding_window_stride,
             "extra_images": extra_images,
@@ -1573,16 +1576,17 @@ class SpatialTiler_BCTHW:
     (models/noise_blending.py): full-size tiles snapped back to end at the frame
     edges, a triangular tent weight per axis (peak at the tile center, floored
     at 0.05 so the weight sum stays positive wherever a tile is the only
-    cover), 2D mask = outer product of the two tents, float32 accumulation,
+    cover),     2D mask = outer product of the two tents, float32 accumulation,
     normalized by the weight sum. The one thing that does NOT carry over: VDD
     blends the noise prediction at every solver step; this pipeline is a
     single-shot regression, so the blend runs once on the DiT's output latent.
 
-    Before accumulation, each tile after the first is affine-aligned (one
-    scale+shift, least-squares over the already-accumulated overlap) --
-    the same fit generate_depth_sliced uses between temporal windows.
-    Without it, tiles from a deterministic model still disagree in global
-    depth calibration and quilt visibly no matter the mask profile.
+    Alignment: with ref_size set, one coherent anchor pass runs the DiT on the
+    input latents downscaled to ref_size, and every tile is affine-aligned to
+    the upscaled reference over its FULL extent (global calibration anchor --
+    featureless backgrounds drift apart between tiles and quilt the blend).
+    Without ref_size, each tile after the first is aligned to the accumulated
+    canvas over the seam band only, which cannot hold back that drift.
 
     Each tile runs an independent DiT forward, so per-tile 0-based RoPE is
     identical to sliced global coordinates: RoPE attention scores depend only
@@ -1593,6 +1597,28 @@ class SpatialTiler_BCTHW:
 
     def __init__(self):
         pass
+
+    @staticmethod
+    def _resize(video, size):
+        """(B, C, T, H, W) -> (B, C, T, *size), bilinear in H, W. T is folded
+        into the batch -- interpolate would read dim 2 as spatial otherwise."""
+        if (video.shape[-2], video.shape[-1]) == tuple(size):
+            return video
+        B, C, T, H, W = video.shape
+        v = video.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        v = F.interpolate(v, size=size, mode="bilinear", align_corners=False)
+        return v.view(B, T, C, *size).permute(0, 2, 1, 3, 4)
+
+    @staticmethod
+    def _lowpass(video):
+        """Quarter-res bounce: a cheap symmetric low-pass, so the calibration
+        fit sees the same blur on both sides whatever they are."""
+        H, W = video.shape[-2:]
+        if H < 8 or W < 8:
+            return video
+        quarter = (max(2, H // 4), max(2, W // 4))
+        return SpatialTiler_BCTHW._resize(
+            SpatialTiler_BCTHW._resize(video, quarter), (H, W))
 
     @staticmethod
     def tile_index(length, size, stride):
@@ -1626,10 +1652,18 @@ class SpatialTiler_BCTHW:
         return rearrange(mask, "H W -> 1 1 1 H W")
 
     @staticmethod
-    def align_affine(curr, ref, region):
+    def align_affine(curr, ref, region, lowpass_fit=False):
         """Least-squares scale+shift making curr match ref over `region` -- the
         same fit compute_scale_and_shift uses between temporal windows, here
-        applied spatially. det ~ 0 (flat overlap) leaves the tile untouched.
+        applied spatially; det ~ 0 relative (flat overlap) leaves the tile
+        untouched.
+
+        lowpass_fit: fit on quarter-res-bounced versions of both sides. Only
+        for the anchor path, where the reference is a downscale-then-upscale
+        and a sharp tile would otherwise fit against a foreign blur and clamp
+        at the scale clip even when tiles agree. The same low-pass op on both
+        cancels the mismatch. Never for the chained path: thin seam bands
+        need raw values -- the low-pass bleeds outside-coverage zeros in.
 
         region broadcasts against curr, so a00/a01/b0/b1 count each pixel
         B*C*T times; a11 must count identically (expand_as) or the fit is
@@ -1638,8 +1672,10 @@ class SpatialTiler_BCTHW:
         the determinant of a constant overlap comes out ~1e-8*relative
         instead of exactly 0, slipping past the degeneracy guard."""
         orig_dtype = curr.dtype
-        curr, ref, region = (t.to(torch.float64)
-                             for t in (curr, ref, region))
+        curr, ref, region = curr.to(torch.float64), ref.to(torch.float64), region.to(torch.float64)
+        if lowpass_fit:
+            # Same low-pass op on both sides: blur mismatch cancels.
+            curr, ref = (SpatialTiler_BCTHW._lowpass(t) for t in (curr, ref))
         a00 = (region * curr * curr).sum()
         a01 = (region * curr).sum()
         a11 = region.expand_as(curr).sum()
@@ -1666,6 +1702,7 @@ class SpatialTiler_BCTHW:
         model_kwargs,
         tensor_names,
         batch_size=None,
+        ref_size=None,
     ):
         size_h, size_w = tile_size
         stride_h, stride_w = size_h - tile_overlap, size_w - tile_overlap
@@ -1693,6 +1730,25 @@ class SpatialTiler_BCTHW:
             (B, C, T, H, W), device=data_device, dtype=torch.float32)
         weight = torch.zeros(
             (1, 1, 1, H, W), device=data_device, dtype=torch.float32)
+        anchor = None
+        if ref_size is not None:
+            # One coherent anchor pass on the input latents downscaled to
+            # ref_size; its upscaled output is the reference every tile is
+            # aligned against over its FULL extent. Small by construction --
+            # never itself tiled.
+            downscaled = {
+                tensor_name: self._resize(tensor_dict[tensor_name], ref_size)
+                for tensor_name in tensor_names
+            }
+            model_kwargs.update(downscaled)
+            anchor = self._resize(
+                model_fn(**model_kwargs).to(device=data_device,
+                                            dtype=torch.float32),
+                (H, W),
+            )
+            model_kwargs.update(tensor_dict)
+            print(f"  latent anchor: one reference pass at "
+                  f"{ref_size[0]}x{ref_size[1]}")
         for h, h_ in self.tile_index(H, size_h, stride_h):
             for w, w_ in self.tile_index(W, size_w, stride_w):
                 model_kwargs.update(
@@ -1706,14 +1762,23 @@ class SpatialTiler_BCTHW:
                 model_output = model_fn(**model_kwargs).to(
                     device=data_device, dtype=torch.float32
                 )
-                # Align to the accumulated canvas over the overlap before
-                # blending: deterministic per-tile outputs disagree in global
-                # depth calibration; raw feathering alone quilts visibly.
-                region = (weight[:, :, :, h:h_, w:w_] > 0).to(torch.float32)
-                if region.any():
-                    ref = (value[:, :, :, h:h_, w:w_]
-                           / weight[:, :, :, h:h_, w:w_].clamp(min=1e-5))
-                    scale, shift = self.align_affine(model_output, ref, region)
+                # Align the tile before blending: full-extent anchor if set,
+                # else the accumulated canvas over the seam band. Deterministic
+                # per-tile outputs disagree in global depth calibration; raw
+                # feathering alone quilts visibly.
+                if anchor is not None:
+                    region = torch.ones((1, 1, 1, h_ - h, w_ - w),
+                                        device=data_device, dtype=torch.float32)
+                    canvas = anchor[:, :, :, h:h_, w:w_]
+                    lowpass_fit = True
+                else:
+                    region = (weight[:, :, :, h:h_, w:w_] > 0).to(torch.float32)
+                    canvas = (value[:, :, :, h:h_, w:w_]
+                              / weight[:, :, :, h:h_, w:w_].clamp(min=1e-5))
+                    lowpass_fit = False
+                if anchor is not None or region.any():
+                    scale, shift = self.align_affine(model_output, canvas, region,
+                                                     lowpass_fit)
                     print(f"  latent tile ({h}:{h_}, {w}:{w_}): "
                           f"scale={float(scale):.4f} shift={float(shift):.4f}")
                     model_output = model_output * scale + shift
@@ -1744,6 +1809,7 @@ def model_fn_wan_video(
     sliding_window_stride: Optional[int] = None,
     latent_tile_size: Optional[tuple[int, int]] = None,
     latent_tile_overlap: Optional[int] = 8,
+    latent_ref_size: Optional[tuple[int, int]] = None,
     cfg_merge: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -1805,6 +1871,7 @@ def model_fn_wan_video(
             model_kwargs=model_kwargs,
             tensor_names=["latents", "y"],
             batch_size=2 if cfg_merge else 1,
+            ref_size=latent_ref_size,
         )
 
     if use_unified_sequence_parallel:

@@ -43,6 +43,7 @@ def fn(input_video):
         latent_tile=None,
         latent_tile_overlap=8,
         spatial_ref_width=0,
+        latent_ref=None,
     ))
     output_video = save_results(depth, origin_fps, Namespace(
         input_video=input_video,

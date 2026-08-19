@@ -51,7 +51,7 @@ from PIL import Image
 
 # Sibling script: sys.path[0] is test_script/ when launched as
 # `python test_script/eval_depth_dump.py` (how infer_bash/*.sh call it).
-from test_single_video import (check_latent_tile, check_vae_tile,
+from test_single_video import (check_latent_ref, check_latent_tile, check_vae_tile,
                                generate_depth_sliced, get_spatial_tile_index,
                                get_window_index, is_oom, load_model, read_video,
                                resize_for_training_scale, spatial_blend_mask)
@@ -238,7 +238,8 @@ def find_max_size(model, rgb, args):
                                       tile_stride=args.tile_stride,
                                       latent_tile=args.latent_tile,
                                       latent_tile_overlap=args.latent_tile_overlap,
-                                      spatial_ref_width=args.spatial_ref_width)
+                                      spatial_ref_width=args.spatial_ref_width,
+                                      latent_ref=args.latent_ref)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -368,6 +369,13 @@ def parse_args():
                         "reference -- one extra full-window pass at this width, "
                         "crops LSQ-aligned to it. Removes the calibration drift "
                         "that quilts featureless content. 0 = off.")
+    p.add_argument("--latent_ref", "--latent-ref", type=int, nargs=2, default=None,
+                   metavar=("H", "W"),
+                   help="with --latent_tile: anchor for the tiles -- per window, "
+                        "one coherent pass on the input latents downscaled to HxW "
+                        "(latent units), upscaled back, and every tile "
+                        "LSQ-aligned to it over its full extent (replaces "
+                        "seam-band alignment). H W even.")
     p.add_argument("--find_max_size", action="store_true",
                    help="probe the largest input that fits this GPU at --window_size, "
                         "then exit without dumping anything")
@@ -436,6 +444,7 @@ def check_latent_tile_args():
     check_latent_tile(None, 8)                    # off
     check_latent_tile((34, 64), 8)                # normal
     check_latent_tile((34, 64), 0)                # touching tiles
+    check_latent_ref((144, 256))                  # a normal anchor size
     for bad in (((34, 64), 34),                   # overlap eats the tile (stride 0)
                 ((31, 64), 8),                    # odd tile breaks 2x2 patchify
                 ((34, 64), 7),                    # odd overlap -> odd tile starts
@@ -445,6 +454,12 @@ def check_latent_tile_args():
         except ValueError:
             continue
         raise AssertionError(bad)
+    for bad_ref in ((143, 256), (145, 256), (0, 256)):   # odd / empty anchor
+        try:
+            check_latent_ref(bad_ref)
+        except ValueError:
+            continue
+        raise AssertionError(bad_ref)
 
     tiler = SpatialTiler_BCTHW()
     for L, size, ov in ((64, 34, 16), (34, 34, 8), (50, 34, 16), (37, 32, 8),
