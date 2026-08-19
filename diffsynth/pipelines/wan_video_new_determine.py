@@ -716,6 +716,7 @@ class WanVideoPipeline(BasePipeline):
         latent_tile_size: Optional[tuple[int, int]] = None,
         latent_tile_overlap: Optional[int] = 8,
         latent_ref_size: Optional[tuple[int, int]] = None,
+    latent_band_merge: bool = False,
         # Sliding window
         sliding_window_size: Optional[int] = None,
         sliding_window_stride: Optional[int] = None,
@@ -776,6 +777,7 @@ class WanVideoPipeline(BasePipeline):
             "latent_tile_size": latent_tile_size,
             "latent_tile_overlap": latent_tile_overlap,
             "latent_ref_size": latent_ref_size,
+            "latent_band_merge": latent_band_merge,
             "sliding_window_size": sliding_window_size,
             "sliding_window_stride": sliding_window_stride,
             "extra_images": extra_images,
@@ -1703,6 +1705,7 @@ class SpatialTiler_BCTHW:
         tensor_names,
         batch_size=None,
         ref_size=None,
+        band_merge=False,
     ):
         size_h, size_w = tile_size
         stride_h, stride_w = size_h - tile_overlap, size_w - tile_overlap
@@ -1776,12 +1779,40 @@ class SpatialTiler_BCTHW:
                     canvas = (value[:, :, :, h:h_, w:w_]
                               / weight[:, :, :, h:h_, w:w_].clamp(min=1e-5))
                     lowpass_fit = False
-                if anchor is not None or region.any():
+                if (anchor is not None or region.any()) and not band_merge:
                     scale, shift = self.align_affine(model_output, canvas, region,
                                                      lowpass_fit)
                     print(f"  latent tile ({h}:{h_}, {w}:{w_}): "
                           f"scale={float(scale):.4f} shift={float(shift):.4f}")
                     model_output = model_output * scale + shift
+                if band_merge and anchor is not None:
+                    # Split the bands instead of trusting the fit: the anchor is
+                    # the only globally calibrated estimate, the tile the only one
+                    # with detail. A scale+shift can only repair a uniform offset,
+                    # so tiles that disagree in SHAPE (featureless water) fight the
+                    # fit until it hits the clip. Here the anchor supplies every
+                    # frequency it can represent and the tile only what it cannot,
+                    # so no tile can drift: adjacent tiles share the low band by
+                    # construction. Cut at the anchor's own Nyquist -- lower and
+                    # the tile re-supplies the mid band where drift lives, higher
+                    # and nobody supplies it.
+                    # No scale+shift first: measured on a 2K proxy, fitting the
+                    # tile to the anchor before taking its detail costs detail
+                    # (0.93 -> 0.85 clipped, 0.69 unclipped -- the fit wants
+                    # 0.05-0.5 because a crop's range dwarfs the anchor's over
+                    # that region). Tile and anchor come from the same model, so
+                    # the detail is already in the anchor's units, and it is
+                    # zero-mean, so the shift is irrelevant too.
+                    cut = (max(2, (h_ - h) * ref_size[0] // H),
+                           max(2, (w_ - w) * ref_size[1] // W))
+                    detail = model_output - self._resize(
+                        self._resize(model_output, cut), (h_ - h, w_ - w))
+                    model_output = canvas + detail
+                    # No scale/shift is fitted here, so the per-tile print above
+                    # never fires: report what the tile actually contributed, so a
+                    # dead anchor or a tile adding nothing is visible at runtime.
+                    print(f"  latent tile ({h}:{h_}, {w}:{w_}): band merge, "
+                          f"detail rms={float(detail.pow(2).mean().sqrt()):.4f}")
                 mask = self.build_mask(model_output).to(device=data_device)
                 value[:, :, :, h:h_, w:w_] += model_output * mask
                 weight[:, :, :, h:h_, w:w_] += mask
@@ -1810,6 +1841,7 @@ def model_fn_wan_video(
     latent_tile_size: Optional[tuple[int, int]] = None,
     latent_tile_overlap: Optional[int] = 8,
     latent_ref_size: Optional[tuple[int, int]] = None,
+    latent_band_merge: bool = False,
     cfg_merge: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -1872,6 +1904,7 @@ def model_fn_wan_video(
             tensor_names=["latents", "y"],
             batch_size=2 if cfg_merge else 1,
             ref_size=latent_ref_size,
+            band_merge=latent_band_merge,
         )
 
     if use_unified_sequence_parallel:

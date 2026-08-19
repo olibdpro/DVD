@@ -178,8 +178,24 @@ def spatial_blend_mask(h, h_, w, w_, H, W, overlap_h, overlap_w):
     return np.minimum(mask_h[:, None], mask_w[None, :])
 
 
+def _lowpass_to(depth, ref_hw, full_hw):
+    """Band-limit a (B, T, h, w, C) crop to the resolution the anchor actually
+    has over it: shrink by the anchor's own downscale factor and bounce back."""
+    B, T, h, w, C = depth.shape
+    ch = max(2, round(h * ref_hw[0] / full_hw[0]))
+    cw = max(2, round(w * ref_hw[1] / full_hw[1]))
+    out = np.empty_like(depth)
+    for b in range(B):
+        for t in range(T):
+            small = cv2.resize(depth[b, t], (cw, ch), interpolation=cv2.INTER_AREA)
+            up = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+            out[b, t] = up.reshape(h, w, C)
+    return out
+
+
 def _run_pipe(model, rgb_slice, tiled, tile_size=None, tile_stride=None,
-              latent_tile=None, latent_tile_overlap=8, latent_ref=None):
+              latent_tile=None, latent_tile_overlap=8, latent_ref=None,
+              latent_band_merge=False):
     """One pipeline call on a (B, T, C, H, W) slice. Spatial crops go through
     the exact same path as full frames, so conditioning stays in-distribution."""
     B, T, _, H, W = rgb_slice.shape
@@ -191,6 +207,7 @@ def _run_pipe(model, rgb_slice, tiled, tile_size=None, tile_stride=None,
         tile_kwargs["latent_tile_overlap"] = latent_tile_overlap
         if latent_ref is not None:
             tile_kwargs["latent_ref_size"] = tuple(latent_ref)
+            tile_kwargs["latent_band_merge"] = latent_band_merge
     return model.pipe(
         prompt=[""] * B,
         negative_prompt=[""] * B,
@@ -215,7 +232,8 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
                             spatial_tile, spatial_overlap,
                             tile_size=None, tile_stride=None,
                             latent_tile=None, latent_tile_overlap=8,
-                            ref_width=0, latent_ref=None):
+                            ref_width=0, latent_ref=None,
+                            latent_band_merge=False):
     """Depth for one temporal window, inferred on overlapping spatial crops and
     feather-blended back to full frame. Each crop runs the whole pipeline
     (VAE + DiT) on its own, so the VAE's global spatial attention stays intact
@@ -244,13 +262,18 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
         # latent-tiled (one coherent pass) and is cheap at this size.
         ref_rgb, _ = resize_for_training_scale(
             rgb_window, round(H * ref_width / W), ref_width)
+        ref_hw = ref_rgb.shape[-2:]
         ref_depth = _run_pipe(model, ref_rgb, tiled,
                               tile_size, tile_stride)['depth'][:, :origin_T]
         B, Tr = ref_depth.shape[0], ref_depth.shape[1]
         ref_t = torch.from_numpy(ref_depth).permute(0, 1, 4, 2, 3).float()
         ref_t = F.interpolate(ref_t.reshape(B * Tr, *ref_t.shape[2:]),
                               size=(H, W), mode="bilinear", align_corners=False)
-        ref = ref_t.view(B, Tr, *ref_t.shape[2:]).permute(0, 1, 3, 4, 2).numpy()
+        # view(B, Tr, *shape[2:]) drops C: after the reshape+interpolate ref_t is
+        # (B*Tr, C, H, W), so shape[2:] is (H, W) and the channel dim vanishes from
+        # the target shape -- every call raised "invalid for input of size ...".
+        ref = ref_t.view(B, Tr, ref_t.shape[1], *ref_t.shape[2:]) \
+                   .permute(0, 1, 3, 4, 2).numpy()
         del ref_rgb, ref_depth, ref_t
 
     B = rgb_window.shape[0]
@@ -259,7 +282,8 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
         for w, w_ in w_index:
             outputs = _run_pipe(model, rgb_window[:, :, :, h:h_, w:w_], tiled,
                                 tile_size, tile_stride,
-                                latent_tile, latent_tile_overlap, latent_ref)
+                                latent_tile, latent_tile_overlap, latent_ref,
+                                latent_band_merge)
             tile_depth = outputs['depth'][:, :origin_T]
             if ref is not None:
                 scale, shift = compute_scale_and_shift(
@@ -268,6 +292,14 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
                 print(f"  crop ({h}:{h_}, {w}:{w_}): anchor scale={scale:.4f} "
                       f"shift={shift:.4f}")
                 tile_depth = tile_depth * scale + shift
+                if latent_band_merge:
+                    # Anchor owns every frequency it can represent, the crop only
+                    # what it cannot: a scale+shift cannot repair crops that
+                    # disagree in shape, and the low band is exactly where that
+                    # disagreement quilts. Cut at the anchor's own resolution
+                    # over this crop so the two bands are complementary.
+                    tile_depth = (ref[:, :, h:h_, w:w_]
+                                  + tile_depth - _lowpass_to(tile_depth, ref_hw, (H, W)))
             mask = spatial_blend_mask(h, h_, w, w_, H, W,
                                       spatial_overlap, spatial_overlap)
             if values is None:
@@ -299,8 +331,19 @@ def check_vae_tile(tile_size, tile_stride, tiled=True):
               "is off; ignoring them. (--spatial_tile has its own geometry.)")
 
 
-def check_latent_ref(latent_ref):
-    """Anchor sizing for latent tiles; the anchor pass patchifies 2x2 as well."""
+def check_latent_ref(latent_ref, latent_band_merge=False, spatial_ref_width=0):
+    """Anchor sizing for latent tiles; the anchor pass patchifies 2x2 as well.
+
+    A band merge without an anchor has nothing to take the low band FROM, and
+    the tiler would then skip alignment entirely (the affine branch is off under
+    band merge, the band branch needs the anchor) -- raw feathering, worse than
+    the chained default and silent about it. Refuse the combination.
+    """
+    if latent_band_merge and latent_ref is None and not spatial_ref_width:
+        raise ValueError("--latent_band_merge needs an anchor: --latent_ref H W for "
+                         "the latent tiler, or --spatial_ref_width W for the pixel "
+                         "one. The anchor is what supplies the low band; without it "
+                         "no alignment runs at all.")
     if latent_ref is None:
         return
     if min(latent_ref) < 2 or any(r % 2 for r in latent_ref):
@@ -332,7 +375,8 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
                           spatial_tile=None, spatial_overlap=64,
                           tile_size=None, tile_stride=None,
                           latent_tile=None, latent_tile_overlap=8,
-                          spatial_ref_width=0, latent_ref=None):
+                          spatial_ref_width=0, latent_ref=None,
+                          latent_band_merge=False):
     """partial_on_oom: stop at the window that ran out of memory and return the ones
     already computed (None if the first one failed), instead of propagating. Off by
     default -- silently short output is the wrong answer for callers writing a video.
@@ -373,7 +417,7 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
     """
     check_vae_tile(tile_size, tile_stride, tiled)
     check_latent_tile(latent_tile, latent_tile_overlap)
-    check_latent_ref(latent_ref)
+    check_latent_ref(latent_ref, latent_band_merge, spatial_ref_width)
     B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
     print(f"depth_windows {depth_windows}")
@@ -414,14 +458,16 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
             if spatial_tile is None:
                 outputs = _run_pipe(model, _input_rgb_slice, tiled,
                                     tile_size, tile_stride,
-                                    latent_tile, latent_tile_overlap, latent_ref)
+                                    latent_tile, latent_tile_overlap, latent_ref,
+                                    latent_band_merge)
                 depth_window = outputs['depth'][:, :origin_T]
             else:
                 depth_window = _run_pipe_spatial_tiled(
                     model, _input_rgb_slice, origin_T, tiled,
                     spatial_tile, spatial_overlap, tile_size, tile_stride,
                     latent_tile, latent_tile_overlap,
-                    ref_width=spatial_ref_width, latent_ref=latent_ref)
+                    ref_width=spatial_ref_width, latent_ref=latent_ref,
+                    latent_band_merge=latent_band_merge)
         except RuntimeError as err:
             if not (partial_on_oom and is_oom(err)):
                 raise
@@ -561,7 +607,8 @@ def predict_depth(model, input_tensor, orig_size, args):
         latent_tile=args.latent_tile,
         latent_tile_overlap=args.latent_tile_overlap,
         spatial_ref_width=args.spatial_ref_width,
-        latent_ref=args.latent_ref)[0]
+        latent_ref=args.latent_ref,
+        latent_band_merge=args.latent_band_merge)[0]
     print(f"depth range shape {depth.min()} - {depth.max()}, shape {depth.shape}")
 
     # Post Process: resize back to original
@@ -641,6 +688,13 @@ def parse_args():
                              "this width, crops LSQ-aligned to it. Removes the "
                              "calibration drift that quilts featureless content. "
                              "0 = off.")
+    parser.add_argument('--latent_band_merge', '--latent-band-merge',
+                        action='store_true',
+                        help="with --latent_ref: take the low band from the anchor "
+                             "and only the detail the anchor cannot represent from "
+                             "each tile, instead of relying on the scale+shift fit. "
+                             "Tiles then share the low band by construction, so "
+                             "calibration drift between them cannot quilt.")
     parser.add_argument('--latent_ref', '--latent-ref', type=int, nargs=2,
                         default=None, metavar=('H', 'W'),
                         help="with --latent_tile: anchor for the tiles -- per "

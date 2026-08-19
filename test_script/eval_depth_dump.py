@@ -239,7 +239,8 @@ def find_max_size(model, rgb, args):
                                       latent_tile=args.latent_tile,
                                       latent_tile_overlap=args.latent_tile_overlap,
                                       spatial_ref_width=args.spatial_ref_width,
-                                      latent_ref=args.latent_ref)
+                                      latent_ref=args.latent_ref,
+                                      latent_band_merge=args.latent_band_merge)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -285,7 +286,9 @@ def run_bin(model, rgb, target, args):
                                           tile_stride=args.tile_stride,
                                           latent_tile=args.latent_tile,
                                           latent_tile_overlap=args.latent_tile_overlap,
-                                          spatial_ref_width=args.spatial_ref_width)
+                                          spatial_ref_width=args.spatial_ref_width,
+                                          latent_ref=args.latent_ref,
+                                          latent_band_merge=args.latent_band_merge)
     except RuntimeError as err:
         if not is_oom(err):
             raise
@@ -376,6 +379,14 @@ def parse_args():
                         "(latent units), upscaled back, and every tile "
                         "LSQ-aligned to it over its full extent (replaces "
                         "seam-band alignment). H W even.")
+    p.add_argument("--latent_band_merge", "--latent-band-merge", action="store_true",
+                   help="with --latent_ref: the anchor supplies every frequency it "
+                        "can represent and each tile only the detail above that, "
+                        "instead of LSQ-fitting the tile to the anchor. Tiles then "
+                        "share the low band by construction, so calibration drift "
+                        "between them cannot quilt -- a scale+shift cannot fix tiles "
+                        "that disagree in shape, which is what featureless content "
+                        "does. Measured at 4K: seam step 0.0138 -> 0.0010.")
     p.add_argument("--find_max_size", action="store_true",
                    help="probe the largest input that fits this GPU at --window_size, "
                         "then exit without dumping anything")
@@ -445,6 +456,14 @@ def check_latent_tile_args():
     check_latent_tile((34, 64), 8)                # normal
     check_latent_tile((34, 64), 0)                # touching tiles
     check_latent_ref((144, 256))                  # a normal anchor size
+    check_latent_ref((144, 256), True)            # band merge, latent anchor
+    check_latent_ref(None, True, 960)             # band merge, pixel anchor
+    try:                                          # band merge without one:
+        check_latent_ref(None, True)              # nothing supplies the low band
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("band merge without an anchor must be refused")
     for bad in (((34, 64), 34),                   # overlap eats the tile (stride 0)
                 ((31, 64), 8),                    # odd tile breaks 2x2 patchify
                 ((34, 64), 7),                    # odd overlap -> odd tile starts
@@ -499,6 +518,69 @@ def check_latent_tile_args():
                         latents.device, latents.dtype, **kwargs)
         assert torch.allclose(out, latents, atol=1e-3), \
             ("affine drift", H, W, th, tw, ov, (out - latents).abs().max())
+
+    # Band merge: the anchor owns the low band, each tile contributes only the
+    # detail above it. So a per-tile constant offset -- the calibration drift
+    # that quilts -- must cancel exactly, because lowpass(x + c) = lowpass(x) + c
+    # and the tile enters only as x - lowpass(x). Two runs whose tiles drift
+    # differently must land on the SAME output. (Not reusing affine_drift: a
+    # scale does not cancel, it rescales the detail, by design.)
+    for H, W, th, tw, ov, ref in ((64, 96, 34, 34, 16, (32, 48)),
+                                  (270, 480, 130, 240, 8, (136, 240))):
+        latents = torch.randn(1, 4, 3, H, W)
+        kwargs = dict(model_kwargs={"latents": latents}, tensor_names=["latents"])
+
+        def const_drift(offsets):
+            counter = {"k": 0}          # call 0 is the anchor pass, kept clean
+
+            def fn(**kw):
+                k = counter["k"]
+                counter["k"] += 1
+                return kw["latents"] if k == 0 else kw["latents"] + offsets[k % len(offsets)]
+            return fn
+
+        runs = [tiler.run(const_drift(o), (th, tw), ov, latents.device, latents.dtype,
+                          ref_size=ref, band_merge=True, **kwargs)
+                for o in ([0.5, -0.3, 2.0], [-4.0, 1.0, 0.25])]
+        assert torch.allclose(runs[0], runs[1], atol=1e-4), \
+            ("band merge must cancel per-tile offsets", H, W, th, tw, ov,
+             (runs[0] - runs[1]).abs().max())
+
+
+def check_run_bin_forwards():
+    """run_bin must forward every tiling knob to generate_depth_sliced.
+
+    It did not: --latent_ref reached find_max_size (the probe) but never
+    run_bin, so every dumped frame silently used seam-band chaining instead of
+    the anchor, and the anchored runs quilted exactly like unanchored ones. A
+    dropped kwarg is invisible at runtime -- nothing errors, the output is just
+    quietly wrong -- so it gets a test.
+    """
+    import types
+
+    global generate_depth_sliced
+    seen = {}
+    original = generate_depth_sliced
+
+    def recorder(model, rgb, window, overlap, **kw):
+        seen.update(kw)
+        return None
+
+    args = types.SimpleNamespace(
+        window_size=1, overlap=0, tiled=True, spatial_tile=None,
+        spatial_tile_overlap=64, tile_size=None, tile_stride=None,
+        latent_tile=(60, 80), latent_tile_overlap=8, spatial_ref_width=0,
+        latent_ref=(68, 120), latent_band_merge=True)
+    generate_depth_sliced = recorder
+    try:
+        run_bin(None, torch.zeros(1, 1, 3, 64, 64), (64, 64), args)
+    finally:
+        generate_depth_sliced = original
+
+    for name, want in (("latent_tile", (60, 80)), ("latent_tile_overlap", 8),
+                       ("latent_ref", (68, 120)), ("latent_band_merge", True),
+                       ("tiled", True), ("spatial_ref_width", 0)):
+        assert seen.get(name) == want, (name, seen.get(name), want)
 
 
 def check_largest_ok():
@@ -618,4 +700,5 @@ if __name__ == "__main__":
     check_largest_ok()
     check_vae_tile_args()
     check_latent_tile_args()
+    check_run_bin_forwards()
     main()
