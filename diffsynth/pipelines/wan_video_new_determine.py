@@ -1569,6 +1569,15 @@ class TemporalTiler_BCTHW:
 class SpatialTiler_BCTHW:
     """Spatial (H, W) tiling of the DiT's latent, mirroring TemporalTiler_BCTHW.
 
+    Blending logic imported from VideoDepthDiffusion's SpatialNoiseBlendAdaptive
+    (models/noise_blending.py): full-size tiles snapped back to end at the frame
+    edges, a triangular tent weight per axis (peak at the tile center, floored
+    at 0.05 so the weight sum stays positive wherever a tile is the only
+    cover), 2D mask = outer product of the two tents, float32 accumulation,
+    normalized by the weight sum. The one thing that does NOT carry over: VDD
+    blends the noise prediction at every solver step; this pipeline is a
+    single-shot regression, so the blend runs once on the DiT's output latent.
+
     Each tile runs an independent DiT forward, so per-tile 0-based RoPE is
     identical to sliced global coordinates: RoPE attention scores depend only
     on relative offsets (q^T R_{n-m} k), and a constant index shift cancels in
@@ -1581,37 +1590,34 @@ class SpatialTiler_BCTHW:
 
     @staticmethod
     def tile_index(length, size, stride):
-        """[start, end) pairs covering [0, length), with the same skip rule as
-        the VAE's tiled_encode/decode: a tile is dropped when the previous one
-        already reaches the end; the last tile may be short."""
+        """[start, end) pairs covering [0, length), VDD-style
+        (get_2d_sliding_windows): every tile is full-size; the last one is
+        snapped back to end at `length`, which only ever widens its overlap
+        with the previous tile."""
         index = []
-        for h in range(0, length, stride):
-            if h - stride >= 0 and h - stride + size >= length:
-                continue
-            index.append((h, min(h + size, length)))
+        h = 0
+        while True:
+            h_end = min(h + size, length)
+            index.append((max(0, h_end - size), h_end))
+            if h_end >= length:
+                break
+            h += stride
         return index
 
-    def build_1d_mask(self, length, left_bound, right_bound, border_width):
-        x = torch.ones((length,))
-        # Short edge tiles: never ramp wider than the tile. The > 0 guard also
-        # keeps overlap=0 (touching tiles) off the x[-0:] = empty assignment.
-        border_width = min(border_width, length)
-        if not left_bound and border_width > 0:
-            x[:border_width] = (torch.arange(border_width) + 1) / border_width
-        if not right_bound and border_width > 0:
-            x[-border_width:] = torch.flip(
-                (torch.arange(border_width) + 1) / border_width, dims=(0,))
-        return x
+    def build_1d_weights(self, length):
+        # VDD tent: 0 at the window edges, 1 at the center, + 0.05 floor.
+        # Degenerate 1-2 px tiles (latent smaller than the tile) get a flat
+        # mask -- with a single tile, value/weight is the identity anyway.
+        if length < 3:
+            return torch.ones((length,))
+        x = torch.linspace(0, 1, length)
+        x = torch.min(x, 1 - x)
+        return x / x.max() + 0.05
 
-    def build_mask(self, data, is_bound, border_width):
+    def build_mask(self, data):
         _, _, _, H, W = data.shape
-        h = self.build_1d_mask(H, is_bound[0], is_bound[1], border_width[0])
-        w = self.build_1d_mask(W, is_bound[2], is_bound[3], border_width[1])
-        h = repeat(h, "H -> H W", H=H, W=W)
-        w = repeat(w, "W -> H W", H=H, W=W)
-        mask = torch.stack([h, w]).min(dim=0).values
-        mask = rearrange(mask, "H W -> 1 1 1 H W")
-        return mask
+        mask = torch.outer(self.build_1d_weights(H), self.build_1d_weights(W))
+        return rearrange(mask, "H W -> 1 1 1 H W")
 
     def run(
         self,
@@ -1645,10 +1651,11 @@ class SpatialTiler_BCTHW:
             tensor_dict[tensor_names[0]].device,
             tensor_dict[tensor_names[0]].dtype,
         )
+        # Accumulate in float32 (VDD: prevents rounding jitter in the blend).
         value = torch.zeros(
-            (B, C, T, H, W), device=data_device, dtype=data_dtype)
+            (B, C, T, H, W), device=data_device, dtype=torch.float32)
         weight = torch.zeros(
-            (1, 1, 1, H, W), device=data_device, dtype=data_dtype)
+            (1, 1, 1, H, W), device=data_device, dtype=torch.float32)
         for h, h_ in self.tile_index(H, size_h, stride_h):
             for w, w_ in self.tile_index(W, size_w, stride_w):
                 model_kwargs.update(
@@ -1660,16 +1667,12 @@ class SpatialTiler_BCTHW:
                     }
                 )
                 model_output = model_fn(**model_kwargs).to(
-                    device=data_device, dtype=data_dtype
+                    device=data_device, dtype=torch.float32
                 )
-                mask = self.build_mask(
-                    model_output,
-                    is_bound=(h == 0, h_ >= H, w == 0, w_ >= W),
-                    border_width=(tile_overlap, tile_overlap),
-                ).to(device=data_device, dtype=data_dtype)
+                mask = self.build_mask(model_output).to(device=data_device)
                 value[:, :, :, h:h_, w:w_] += model_output * mask
                 weight[:, :, :, h:h_, w:w_] += mask
-        value /= weight
+        value = (value / weight.clamp(min=1e-5)).to(data_dtype)
         model_kwargs.update(tensor_dict)
         return value
 
