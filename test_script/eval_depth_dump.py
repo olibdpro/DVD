@@ -461,6 +461,22 @@ def check_latent_tile_args():
                         (th, tw), ov, latents.device, latents.dtype, **kwargs)
         assert torch.allclose(out, torch.full_like(latents, 3.14), atol=1e-3), \
             (H, W, th, tw, ov)
+    # Tiles disagreeing by an affine map (the per-tile depth-calibration drift
+    # that quilts raw blends) must be reconciled by the overlap alignment.
+    for H, W, th, tw, ov in ((64, 96, 34, 34, 16), (270, 480, 130, 240, 8)):
+        latents = torch.randn(1, 4, 3, H, W)
+        kwargs = dict(model_kwargs={"latents": latents}, tensor_names=["latents"])
+        counter = {"k": 0}
+
+        def affine_drift(**kw):
+            k = counter["k"]
+            counter["k"] += 1
+            return kw["latents"] if k == 0 else kw["latents"] * 1.2 - 3.0
+
+        out = tiler.run(affine_drift, (th, tw), ov,
+                        latents.device, latents.dtype, **kwargs)
+        assert torch.allclose(out, latents, atol=1e-3), \
+            ("affine drift", H, W, th, tw, ov, (out - latents).abs().max())
 
 
 def check_largest_ok():

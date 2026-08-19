@@ -1578,6 +1578,12 @@ class SpatialTiler_BCTHW:
     blends the noise prediction at every solver step; this pipeline is a
     single-shot regression, so the blend runs once on the DiT's output latent.
 
+    Before accumulation, each tile after the first is affine-aligned (one
+    scale+shift, least-squares over the already-accumulated overlap) --
+    the same fit generate_depth_sliced uses between temporal windows.
+    Without it, tiles from a deterministic model still disagree in global
+    depth calibration and quilt visibly no matter the mask profile.
+
     Each tile runs an independent DiT forward, so per-tile 0-based RoPE is
     identical to sliced global coordinates: RoPE attention scores depend only
     on relative offsets (q^T R_{n-m} k), and a constant index shift cancels in
@@ -1618,6 +1624,37 @@ class SpatialTiler_BCTHW:
         _, _, _, H, W = data.shape
         mask = torch.outer(self.build_1d_weights(H), self.build_1d_weights(W))
         return rearrange(mask, "H W -> 1 1 1 H W")
+
+    @staticmethod
+    def align_affine(curr, ref, region):
+        """Least-squares scale+shift making curr match ref over `region` -- the
+        same fit compute_scale_and_shift uses between temporal windows, here
+        applied spatially. det ~ 0 (flat overlap) leaves the tile untouched.
+
+        region broadcasts against curr, so a00/a01/b0/b1 count each pixel
+        B*C*T times; a11 must count identically (expand_as) or the fit is
+        biased whenever ref is not exactly curr. Everything is cast to
+        float64 BEFORE the products: with fp32 inputs, fl32(c*c) != c^2 and
+        the determinant of a constant overlap comes out ~1e-8*relative
+        instead of exactly 0, slipping past the degeneracy guard."""
+        orig_dtype = curr.dtype
+        curr, ref, region = (t.to(torch.float64)
+                             for t in (curr, ref, region))
+        a00 = (region * curr * curr).sum()
+        a01 = (region * curr).sum()
+        a11 = region.expand_as(curr).sum()
+        b0 = (region * curr * ref).sum()
+        b1 = (region * ref).sum()
+        det = a00 * a11 - a01 * a01
+        # Degenerate (flat) overlap: det is value^2*elements^2-scaled, so the
+        # guard must be relative -- an absolute threshold reads rounding
+        # noise as a fit and mangles constant tiles.
+        if det <= 1e-10 * (a00 * a11):
+            return 1.0, 0.0
+        scale = (a11 * b0 - a01 * b1) / det
+        shift = (-a01 * b0 + a00 * b1) / det
+        # Same clip as the temporal alignment: a wild fit is worse than none.
+        return torch.clamp(scale, 0.7, 1.5).to(orig_dtype), shift.to(orig_dtype)
 
     def run(
         self,
@@ -1669,6 +1706,15 @@ class SpatialTiler_BCTHW:
                 model_output = model_fn(**model_kwargs).to(
                     device=data_device, dtype=torch.float32
                 )
+                # Align to the accumulated canvas over the overlap before
+                # blending: deterministic per-tile outputs disagree in global
+                # depth calibration; raw feathering alone quilts visibly.
+                region = (weight[:, :, :, h:h_, w:w_] > 0).to(torch.float32)
+                if region.any():
+                    ref = (value[:, :, :, h:h_, w:w_]
+                           / weight[:, :, :, h:h_, w:w_].clamp(min=1e-5))
+                    scale, shift = self.align_affine(model_output, ref, region)
+                    model_output = model_output * scale + shift
                 mask = self.build_mask(model_output).to(device=data_device)
                 value[:, :, :, h:h_, w:w_] += model_output * mask
                 weight[:, :, :, h:h_, w:w_] += mask
