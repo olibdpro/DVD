@@ -237,7 +237,8 @@ def find_max_size(model, rgb, args):
                                       tile_size=args.tile_size,
                                       tile_stride=args.tile_stride,
                                       latent_tile=args.latent_tile,
-                                      latent_tile_overlap=args.latent_tile_overlap)
+                                      latent_tile_overlap=args.latent_tile_overlap,
+                                      spatial_ref_width=args.spatial_ref_width)
         except RuntimeError as err:
             # torch.cuda.OutOfMemoryError subclasses RuntimeError, and the host
             # allocator reports exhaustion as a plain one with its own wording.
@@ -282,7 +283,8 @@ def run_bin(model, rgb, target, args):
                                           tile_size=args.tile_size,
                                           tile_stride=args.tile_stride,
                                           latent_tile=args.latent_tile,
-                                          latent_tile_overlap=args.latent_tile_overlap)
+                                          latent_tile_overlap=args.latent_tile_overlap,
+                                          spatial_ref_width=args.spatial_ref_width)
     except RuntimeError as err:
         if not is_oom(err):
             raise
@@ -361,6 +363,11 @@ def parse_args():
                    default=8, metavar="N",
                    help="feather width between latent tiles, in latent units; even "
                         "and < --latent_tile. Default 8 (= 64 px).")
+    p.add_argument("--spatial_ref_width", type=int, default=0, metavar="W",
+                   help="with --spatial_tile: anchor crops to a coherent global "
+                        "reference -- one extra full-window pass at this width, "
+                        "crops LSQ-aligned to it. Removes the calibration drift "
+                        "that quilts featureless content. 0 = off.")
     p.add_argument("--find_max_size", action="store_true",
                    help="probe the largest input that fits this GPU at --window_size, "
                         "then exit without dumping anything")

@@ -1714,6 +1714,8 @@ class SpatialTiler_BCTHW:
                     ref = (value[:, :, :, h:h_, w:w_]
                            / weight[:, :, :, h:h_, w:w_].clamp(min=1e-5))
                     scale, shift = self.align_affine(model_output, ref, region)
+                    print(f"  latent tile ({h}:{h_}, {w}:{w_}): "
+                          f"scale={float(scale):.4f} shift={float(shift):.4f}")
                     model_output = model_output * scale + shift
                 mask = self.build_mask(model_output).to(device=data_device)
                 value[:, :, :, h:h_, w:w_] += model_output * mask
