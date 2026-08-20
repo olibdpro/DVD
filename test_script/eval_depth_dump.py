@@ -51,7 +51,8 @@ from PIL import Image
 
 # Sibling script: sys.path[0] is test_script/ when launched as
 # `python test_script/eval_depth_dump.py` (how infer_bash/*.sh call it).
-from test_single_video import (check_latent_ref, check_latent_tile, check_vae_tile,
+from test_single_video import (AUTO, auto_latent_geometry, TILE_TOKEN_BUDGET,
+                               check_latent_ref, check_latent_tile, check_vae_tile,
                                generate_depth_sliced, get_spatial_tile_index,
                                get_window_index, is_oom, load_model, read_video,
                                resize_for_training_scale, spatial_blend_mask)
@@ -333,7 +334,7 @@ def parse_args():
                         f"'--bins train' with --height/--width runs one arbitrary size")
     p.add_argument("--window_size", type=int, default=81)
     p.add_argument("--overlap", type=int, default=21)
-    p.add_argument("--tiled", action="store_true",
+    p.add_argument("--tiled", action="store_true", default=True,
                    help="tile the VAE encode/decode: slower, lower memory peak, so "
                         "--find_max_size reports a bigger ceiling (degrades output: "
                         "per-tile VAE attention; --spatial_tile keeps quality)")
@@ -380,7 +381,7 @@ def parse_args():
                         "reference -- one extra full-window pass at this width, "
                         "crops LSQ-aligned to it. Removes the calibration drift "
                         "that quilts featureless content. 0 = off.")
-    p.add_argument("--latent_ref", "--latent-ref", type=int, nargs=2, default=None,
+    p.add_argument("--latent_ref", "--latent-ref", type=int, nargs=2, default=AUTO,
                    metavar=("H", "W"),
                    help="with --latent_tile: anchor for the tiles -- per window, "
                         "one coherent pass on the input latents downscaled to HxW "
@@ -388,6 +389,7 @@ def parse_args():
                         "LSQ-aligned to it over its full extent (replaces "
                         "seam-band alignment). H W even.")
     p.add_argument("--latent_band_merge", "--latent-band-merge", action="store_true",
+                   default=True,
                    help="with --latent_ref: the anchor supplies every frequency it "
                         "can represent and each tile only the detail above that, "
                         "instead of LSQ-fitting the tile to the anchor. Tiles then "
@@ -555,6 +557,26 @@ def check_latent_tile_args():
              (runs[0] - runs[1]).abs().max())
 
 
+def check_auto_geometry():
+    """The default tile/anchor geometry: off when small, half res when large,
+    always inside the token budget."""
+    for t, lh, lw in ((1, 60, 80), (1, 68, 122), (8, 60, 80)):
+        assert auto_latent_geometry(t, lh, lw) == (None, None), (t, lh, lw)
+    for t, lh, lw in ((1, 136, 240), (1, 270, 480), (21, 270, 480), (12, 270, 480),
+                      (21, 540, 960), (1, 200, 200)):
+        tile, ref = auto_latent_geometry(t, lh, lw)
+        for name, g in (("tile", tile), ("ref", ref)):
+            assert g is not None, (name, t, lh, lw)
+            assert all(v % 2 == 0 and v >= 4 for v in g), (name, g)
+            assert g[0] <= lh and g[1] <= lw, (name, g, lh, lw)
+            tokens = t * (g[0] / 2) * (g[1] / 2)
+            assert tokens <= TILE_TOKEN_BUDGET, (name, g, tokens)
+    # More frames must never ask for a bigger pass than fewer frames do.
+    wide = auto_latent_geometry(1, 270, 480)[0]
+    narrow = auto_latent_geometry(21, 270, 480)[0]
+    assert narrow[0] <= wide[0] and narrow[1] <= wide[1], (narrow, wide)
+
+
 def check_run_bin_forwards():
     """run_bin must forward every tiling knob to generate_depth_sliced.
 
@@ -708,5 +730,6 @@ if __name__ == "__main__":
     check_largest_ok()
     check_vae_tile_args()
     check_latent_tile_args()
+    check_auto_geometry()
     check_run_bin_forwards()
     main()
