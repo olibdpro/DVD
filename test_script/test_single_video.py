@@ -310,6 +310,60 @@ def _run_pipe_spatial_tiled(model, rgb_window, origin_T, tiled,
     return values / weight[None, None, :, :, None]
 
 
+class _Auto:
+    """Sentinel for "resolve this from the input size at run time".
+
+    Not the string "auto": argparse runs `type=int` over string defaults and
+    would reject it before main() ever sees it.
+    """
+
+    def __repr__(self):
+        return "auto"
+
+
+AUTO = _Auto()
+
+# 480x640 is what DVD trained on; everything below is expressed relative to it.
+TRAIN_LATENT = (60, 80)
+# Largest per-pass DiT load proven to fit: the cluster ran ~175k tokens at 2K.
+# Kept below that so the default never turns a working run into an OOM.
+TILE_TOKEN_BUDGET = 150_000
+
+
+def _even(value, floor=2):
+    return max(floor, int(value) // 2 * 2)
+
+
+def auto_latent_geometry(t_latent, lh, lw):
+    """(tile, anchor) for a (lh, lw) latent at t_latent latent frames, or
+    (None, None) when a single pass is the better answer.
+
+    Half resolution for both, which is where the anchor measured best at 4K:
+    smaller and its low band is too blurry to hold the tiles together (seam
+    energy 59.9 at quarter res vs 28.6 at half), larger and the anchor itself
+    leaves the training distribution and degrades (35.1 at 2/3 res).
+
+    Below 2x the training area a single untiled pass beats any tiling, so this
+    returns nothing and the caller runs the frame whole.
+
+    Both geometries then shrink until one pass fits TILE_TOKEN_BUDGET -- tokens
+    scale with frames, so what is comfortable for a still is not for a window.
+    Tile size does not measurably affect quality (90/130/180 all scored the
+    same), so memory is the only thing that decides it; the anchor shrinking is
+    a real quality cost, and is why a long window wants a smaller anchor than
+    the 4K still that this default was tuned on.
+    """
+    if lh * lw <= 2 * TRAIN_LATENT[0] * TRAIN_LATENT[1]:
+        return None, None
+
+    def fit(h, w):
+        while t_latent * (h / 2) * (w / 2) > TILE_TOKEN_BUDGET and h > 4 and w > 4:
+            h, w = h * 0.85, w * 0.85
+        return _even(h, 4), _even(w, 4)
+
+    return fit(lh / 2, lw / 2), fit(lh / 2, lw / 2)
+
+
 def check_vae_tile(tile_size, tile_stride, tiled=True):
     """Reject VAE tile geometry the VAE would silently turn into NaN."""
     if (tile_size is None) != (tile_stride is None):
@@ -374,9 +428,9 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
                           partial_on_oom=False, tiled=False,
                           spatial_tile=None, spatial_overlap=64,
                           tile_size=None, tile_stride=None,
-                          latent_tile=None, latent_tile_overlap=8,
-                          spatial_ref_width=0, latent_ref=None,
-                          latent_band_merge=False):
+                          latent_tile=AUTO, latent_tile_overlap=8,
+                          spatial_ref_width=0, latent_ref=AUTO,
+                          latent_band_merge=True):
     """partial_on_oom: stop at the window that ran out of memory and return the ones
     already computed (None if the first one failed), instead of propagating. Off by
     default -- silently short output is the wrong answer for callers writing a video.
@@ -415,10 +469,24 @@ def generate_depth_sliced(model, input_rgb, window_size=45, overlap=9, scale_onl
     as the full-extent scale/shift LSQ target per crop. Removes the per-crop
     depth-calibration drift that quilts featureless content; 0 = off.
     """
+    B, T, C, H, W = input_rgb.shape
+    if latent_tile is AUTO or latent_ref is AUTO:
+        # Window length drives the token count as much as resolution does, so
+        # the default is resolved here rather than at the CLI.
+        t_latent = (min(window_size, T) - 1) // 4 + 1
+        auto_tile, auto_ref = auto_latent_geometry(t_latent, H // 8, W // 8)
+        if latent_tile is AUTO:
+            latent_tile = auto_tile
+        if latent_ref is AUTO:
+            latent_ref = auto_ref if latent_tile is not None else None
+        if latent_tile is None:
+            latent_band_merge = False       # nothing to merge; single pass
+        print(f"auto tiling: latent {H // 8}x{W // 8} at {t_latent} latent frames "
+              f"-> tile {latent_tile}, anchor {latent_ref}, "
+              f"band merge {latent_band_merge}")
     check_vae_tile(tile_size, tile_stride, tiled)
     check_latent_tile(latent_tile, latent_tile_overlap)
     check_latent_ref(latent_ref, latent_band_merge, spatial_ref_width)
-    B, T, C, H, W = input_rgb.shape
     depth_windows = get_window_index(T, window_size, overlap)
     print(f"depth_windows {depth_windows}")
     if latent_tile is not None:
@@ -648,10 +716,15 @@ def parse_args():
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument("--overlap", type=int, default=9)
     parser.add_argument('--grayscale', action='store_true')
-    parser.add_argument('--tiled', action='store_true',
+    parser.add_argument('--tiled', action='store_true', default=True,
                         help="tile the VAE encode/decode: slower, lower memory peak, "
                              "but degrades output (per-tile VAE attention); "
                              "--spatial_tile is the quality-preserving alternative")
+    parser.add_argument('--no_tiled', dest='tiled', action='store_false',
+                        help="decode the VAE whole. Costs memory (12.2 vs 4.7 GiB at "
+                             "1080p) and is noisier: the overlapped tile decodes "
+                             "average out decoder artifacts (2 px checkerboard "
+                             "187.6 -> 96.0).")
     parser.add_argument('--tile_size', type=int, nargs=2, default=None,
                         metavar=('H', 'W'),
                         help="VAE tile geometry for --tiled, in latent units "
@@ -671,13 +744,16 @@ def parse_args():
     parser.add_argument('--spatial_tile_overlap', type=int, default=64,
                         help="feather width between spatial crops in pixels")
     parser.add_argument('--latent_tile', '--latent-tile', type=int, nargs=2,
-                        default=None, metavar=('H', 'W'),
+                        default=AUTO, metavar=('H', 'W'),
                         help="run the DiT on overlapping HxW tiles of the latent "
                              "(1 unit = 8 px) and feather-blend the depth latents "
                              "before one global VAE decode. Shrinks the DiT peak -- "
                              "what OOMs at large sizes -- while temporal context and "
                              "the VAE both stay whole (unlike --tiled). H W must be "
                              "even. Combine with --tiled to bound the VAE too.")
+    parser.add_argument('--no_latent_tile', dest='latent_tile',
+                        action='store_const', const=None,
+                        help="one DiT pass over the whole latent instead of tiles.")
     parser.add_argument('--latent_tile_overlap', '--latent-tile-overlap', type=int,
                         default=8, metavar='N',
                         help="feather width between latent tiles, in latent units; "
@@ -688,15 +764,23 @@ def parse_args():
                              "this width, crops LSQ-aligned to it. Removes the "
                              "calibration drift that quilts featureless content. "
                              "0 = off.")
+    parser.add_argument('--no_latent_ref', dest='latent_ref',
+                        action='store_const', const=None,
+                        help="drop the anchor; tiles align to the accumulated "
+                             "canvas over the seam band only (quilts).")
+    parser.add_argument('--no_band_merge', dest='latent_band_merge',
+                        action='store_false',
+                        help="LSQ-fit each tile to the anchor instead of splitting "
+                             "bands. Measured worse: seam step 0.0138 vs 0.0010.")
     parser.add_argument('--latent_band_merge', '--latent-band-merge',
-                        action='store_true',
+                        action='store_true', default=True,
                         help="with --latent_ref: take the low band from the anchor "
                              "and only the detail the anchor cannot represent from "
                              "each tile, instead of relying on the scale+shift fit. "
                              "Tiles then share the low band by construction, so "
                              "calibration drift between them cannot quilt.")
     parser.add_argument('--latent_ref', '--latent-ref', type=int, nargs=2,
-                        default=None, metavar=('H', 'W'),
+                        default=AUTO, metavar=('H', 'W'),
                         help="with --latent_tile: anchor for the tiles -- per "
                              "window, one coherent pass on the input latents "
                              "downscaled to HxW (latent units), upscaled back, "

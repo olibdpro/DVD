@@ -28,8 +28,8 @@ from diffsynth.pipelines.wan_video_new_determine import \
 from examples.wanvideo.model_training.WanTrainingModule import \
     WanTrainingModule  # noqa: E402
 from test_script.test_single_video import (  # noqa: E402
-    check_latent_ref, check_latent_tile, check_vae_tile, generate_depth_sliced,
-    resize_for_training_scale)
+    AUTO, check_latent_ref, check_latent_tile, check_vae_tile,
+    generate_depth_sliced, resize_for_training_scale)
 
 # Wan2.1-T2V-1.3B, the config wan_video_dit.py:789-802 hash-detects from the
 # base weights. Hardcoded because we never load them: the DVD checkpoint carries
@@ -98,24 +98,31 @@ def parse_args():
     p.add_argument("--width", type=int, default=3840)
     p.add_argument("--tag", default="", help="suffix on the output names, to keep runs apart")
     p.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
-    p.add_argument("--tiled", action="store_true")
+    p.add_argument("--tiled", action="store_true", default=True)
+    p.add_argument("--no_tiled", dest="tiled", action="store_false")
     p.add_argument("--tile_size", type=int, nargs=2, default=None, metavar=("H", "W"))
     p.add_argument("--tile_stride", type=int, nargs=2, default=None, metavar=("H", "W"))
     p.add_argument("--spatial_tile", type=int, nargs=2, default=None, metavar=("H", "W"))
     p.add_argument("--spatial_tile_overlap", type=int, default=64)
     p.add_argument("--spatial_ref_width", type=int, default=0)
-    p.add_argument("--latent_tile", "--latent-tile", type=int, nargs=2, default=None,
-                   metavar=("H", "W"))
+    p.add_argument("--latent_tile", "--latent-tile", type=int, nargs=2,
+                   default=AUTO, metavar=("H", "W"))
+    p.add_argument("--no_latent_tile", dest="latent_tile", action="store_const", const=None)
     p.add_argument("--latent_tile_overlap", "--latent-tile-overlap", type=int, default=8)
-    p.add_argument("--latent_ref", "--latent-ref", type=int, nargs=2, default=None,
-                   metavar=("H", "W"))
+    p.add_argument("--latent_ref", "--latent-ref", type=int, nargs=2,
+                   default=AUTO, metavar=("H", "W"))
+    p.add_argument("--no_latent_ref", dest="latent_ref", action="store_const", const=None)
     p.add_argument("--latent_band_merge", "--latent-band-merge", action="store_true",
+                   default=True,
                    help="anchor supplies the low band, tiles only the detail above it")
+    p.add_argument("--no_band_merge", dest="latent_band_merge", action="store_false")
     args = p.parse_args()
     check_vae_tile(args.tile_size, args.tile_stride, args.tiled)
-    check_latent_tile(args.latent_tile, args.latent_tile_overlap)
-    check_latent_ref(args.latent_ref, args.latent_band_merge,
-                     args.spatial_ref_width)
+    if args.latent_tile is not AUTO:
+        check_latent_tile(args.latent_tile, args.latent_tile_overlap)
+    if args.latent_ref is not AUTO:
+        check_latent_ref(args.latent_ref, args.latent_band_merge,
+                         args.spatial_ref_width)
     return args
 
 

@@ -355,7 +355,15 @@ def parse_args():
                         "preserved. H W must be 16-aligned.")
     p.add_argument("--spatial_tile_overlap", type=int, default=64,
                    help="feather width between spatial crops in pixels")
-    p.add_argument("--latent_tile", "--latent-tile", type=int, nargs=2, default=None,
+    p.add_argument("--no_latent_tile", dest="latent_tile", action="store_const",
+                   const=None, help="one DiT pass over the whole latent")
+    p.add_argument("--no_latent_ref", dest="latent_ref", action="store_const",
+                   const=None, help="drop the anchor (tiles then quilt)")
+    p.add_argument("--no_band_merge", dest="latent_band_merge", action="store_false",
+                   help="LSQ-fit tiles to the anchor instead of splitting bands")
+    p.add_argument("--no_tiled", dest="tiled", action="store_false",
+                   help="decode the VAE whole: more memory, noisier output")
+    p.add_argument("--latent_tile", "--latent-tile", type=int, nargs=2, default=AUTO,
                    metavar=("H", "W"),
                    help="run the DiT on overlapping HxW tiles of the latent (1 unit "
                         "= 8 px) and feather-blend the depth latents before one "
